@@ -42,6 +42,12 @@ final class MemoryTransport implements MqttTransport {
     _incoming.add(data);
   }
 
+  /// Simulates a connection failure by emitting [error] to the incoming
+  /// stream, as a real transport would on socket error.
+  void injectError(Object error) {
+    _incoming.addError(error);
+  }
+
   @override
   Stream<Uint8List> get incoming => _incoming.stream;
 

@@ -21,10 +21,9 @@ import '../packet/subscribe.dart';
 import '../packet/unsuback.dart';
 import '../packet/unsubscribe.dart';
 import '../property/mqtt_property.dart';
-import '../session/incoming_qos2.dart';
+import '../session/mqtt_session.dart';
 import '../session/outgoing_qos1.dart';
 import '../session/outgoing_qos2.dart';
-import '../session/packet_identifier_pool.dart';
 import '../subscription.dart';
 import '../transport/mqtt_transport.dart';
 import '../transport/tcp_transport.dart';
@@ -84,14 +83,12 @@ final class MqttClient {
   final StreamController<MqttMessage> _messages =
       StreamController<MqttMessage>.broadcast(sync: true);
 
-  final PacketIdentifierPool _packetIds = PacketIdentifierPool();
+  final MqttSession _session = MqttSession();
   final Map<int, Completer<MqttSubackPacket>> _pendingSubscribes = {};
   final Map<int, Completer<MqttUnsubackPacket>> _pendingUnsubscribes = {};
-  final OutgoingQos1Store _outgoingQos1 = OutgoingQos1Store();
-  final OutgoingQos2Store _outgoingQos2 = OutgoingQos2Store();
-  final IncomingQos2Store _incomingQos2 = IncomingQos2Store();
 
   bool _connected = false;
+  bool _sessionPresent = false;
 
   // Connect settings, retained for reconnect and rebuilds.
   bool _cleanStart = true;
@@ -102,6 +99,9 @@ final class MqttClient {
   MqttConnectionState get state => _connectionManager.state;
 
   Stream<MqttConnectionState> get stateStream => _connectionManager.stateStream;
+
+  /// Whether the broker resumed a previous session on the last CONNACK.
+  bool get sessionPresent => _sessionPresent;
 
   /// Incoming application messages.
   Stream<MqttMessage> get messages => _messages.stream;
@@ -119,6 +119,10 @@ final class MqttClient {
     _sessionExpiryInterval = sessionExpiryInterval;
     _connectProperties = properties;
     _connectionManager.connackTimeout = connackTimeout;
+
+    if (cleanStart) {
+      _discardSession(notify: false, clearSubscriptions: true);
+    }
 
     await _connectionManager.start(_buildConnectPacket());
   }
@@ -147,7 +151,7 @@ final class MqttClient {
     String topicFilter, {
     MqttSubscriptionOptions options = const MqttSubscriptionOptions(),
   }) async {
-    final packetIdentifier = await _packetIds.allocate();
+    final packetIdentifier = await _session.packetIds.allocate();
     final completer = Completer<MqttSubackPacket>();
     _pendingSubscribes[packetIdentifier] = completer;
     try {
@@ -159,9 +163,10 @@ final class MqttClient {
       );
       final suback = await completer.future;
       _throwIfSubackRejected(suback);
+      _session.subscriptions.add(MqttSubscription(topicFilter, options: options));
     } finally {
       _pendingSubscribes.remove(packetIdentifier);
-      _packetIds.release(packetIdentifier);
+      _session.packetIds.release(packetIdentifier);
     }
   }
 
@@ -170,7 +175,7 @@ final class MqttClient {
     if (subscriptions.isEmpty) {
       return;
     }
-    final packetIdentifier = await _packetIds.allocate();
+    final packetIdentifier = await _session.packetIds.allocate();
     final completer = Completer<MqttSubackPacket>();
     _pendingSubscribes[packetIdentifier] = completer;
     try {
@@ -182,9 +187,12 @@ final class MqttClient {
       );
       final suback = await completer.future;
       _throwIfSubackRejected(suback);
+      for (final subscription in subscriptions) {
+        _session.subscriptions.add(subscription);
+      }
     } finally {
       _pendingSubscribes.remove(packetIdentifier);
-      _packetIds.release(packetIdentifier);
+      _session.packetIds.release(packetIdentifier);
     }
   }
 
@@ -193,7 +201,7 @@ final class MqttClient {
     if (topicFilters.isEmpty) {
       return;
     }
-    final packetIdentifier = await _packetIds.allocate();
+    final packetIdentifier = await _session.packetIds.allocate();
     final completer = Completer<MqttUnsubackPacket>();
     _pendingUnsubscribes[packetIdentifier] = completer;
     try {
@@ -212,9 +220,12 @@ final class MqttClient {
           );
         }
       }
+      for (final topicFilter in topicFilters) {
+        _session.subscriptions.remove(topicFilter);
+      }
     } finally {
       _pendingUnsubscribes.remove(packetIdentifier);
-      _packetIds.release(packetIdentifier);
+      _session.packetIds.release(packetIdentifier);
     }
   }
 
@@ -255,7 +266,7 @@ final class MqttClient {
     required bool retain,
     required List<MqttProperty> properties,
   }) async {
-    final packetIdentifier = await _packetIds.allocate();
+    final packetIdentifier = await _session.packetIds.allocate();
     final entry = OutgoingQos1Entry(
       packetIdentifier: packetIdentifier,
       topic: topic,
@@ -263,7 +274,7 @@ final class MqttClient {
       retain: retain,
       properties: properties,
     );
-    _outgoingQos1.put(entry);
+    _session.outgoingQos1.put(entry);
     try {
       _connectionManager.send(
         MqttPublishPacket(
@@ -277,8 +288,8 @@ final class MqttClient {
       );
       return await entry.completer.future;
     } finally {
-      _outgoingQos1.remove(packetIdentifier);
-      _packetIds.release(packetIdentifier);
+      _session.outgoingQos1.remove(packetIdentifier);
+      _session.packetIds.release(packetIdentifier);
     }
   }
 
@@ -288,7 +299,7 @@ final class MqttClient {
     required bool retain,
     required List<MqttProperty> properties,
   }) async {
-    final packetIdentifier = await _packetIds.allocate();
+    final packetIdentifier = await _session.packetIds.allocate();
     final entry = OutgoingQos2Entry(
       packetIdentifier: packetIdentifier,
       topic: topic,
@@ -296,7 +307,7 @@ final class MqttClient {
       retain: retain,
       properties: properties,
     );
-    _outgoingQos2.put(entry);
+    _session.outgoingQos2.put(entry);
     try {
       _connectionManager.send(
         MqttPublishPacket(
@@ -310,8 +321,8 @@ final class MqttClient {
       );
       return await entry.completer.future;
     } finally {
-      _outgoingQos2.remove(packetIdentifier);
-      _packetIds.release(packetIdentifier);
+      _session.outgoingQos2.remove(packetIdentifier);
+      _session.packetIds.release(packetIdentifier);
     }
   }
 
@@ -378,7 +389,7 @@ final class MqttClient {
   }
 
   void _handleIncomingQos2(MqttPublishPacket publish) {
-    final isNew = _incomingQos2.add(publish.packetIdentifier);
+    final isNew = _session.incomingQos2.add(publish.packetIdentifier);
     if (isNew) {
       _deliver(publish);
     }
@@ -388,11 +399,11 @@ final class MqttClient {
   }
 
   void _handlePuback(MqttPubackPacket puback) {
-    final entry = _outgoingQos1.remove(puback.packetIdentifier);
+    final entry = _session.outgoingQos1.remove(puback.packetIdentifier);
     if (entry == null) {
       return;
     }
-    _packetIds.release(puback.packetIdentifier);
+    _session.packetIds.release(puback.packetIdentifier);
     entry.completer.complete(
       MqttPublishResult(
         reasonCode: puback.reasonCode ?? MqttReasonCode.success,
@@ -402,14 +413,14 @@ final class MqttClient {
   }
 
   void _handlePubrec(MqttPubrecPacket pubrec) {
-    final entry = _outgoingQos2[pubrec.packetIdentifier];
+    final entry = _session.outgoingQos2[pubrec.packetIdentifier];
     if (entry == null) {
       return;
     }
     final reasonCode = pubrec.reasonCode;
     if (reasonCode != null && reasonCode.value >= 0x80) {
-      _outgoingQos2.remove(pubrec.packetIdentifier);
-      _packetIds.release(pubrec.packetIdentifier);
+      _session.outgoingQos2.remove(pubrec.packetIdentifier);
+      _session.packetIds.release(pubrec.packetIdentifier);
       entry.completer.complete(
         MqttPublishResult(reasonCode: reasonCode, properties: pubrec.properties),
       );
@@ -422,8 +433,8 @@ final class MqttClient {
   }
 
   void _handlePubrel(MqttPubrelPacket pubrel) {
-    final known = _incomingQos2.contains(pubrel.packetIdentifier);
-    _incomingQos2.remove(pubrel.packetIdentifier);
+    final known = _session.incomingQos2.contains(pubrel.packetIdentifier);
+    _session.incomingQos2.remove(pubrel.packetIdentifier);
     _connectionManager.send(
       MqttPubcompPacket(
         packetIdentifier: pubrel.packetIdentifier,
@@ -434,11 +445,11 @@ final class MqttClient {
   }
 
   void _handlePubcomp(MqttPubcompPacket pubcomp) {
-    final entry = _outgoingQos2.remove(pubcomp.packetIdentifier);
+    final entry = _session.outgoingQos2.remove(pubcomp.packetIdentifier);
     if (entry == null) {
       return;
     }
-    _packetIds.release(pubcomp.packetIdentifier);
+    _session.packetIds.release(pubcomp.packetIdentifier);
     entry.completer.complete(
       MqttPublishResult(
         reasonCode: pubcomp.reasonCode ?? MqttReasonCode.success,
@@ -462,10 +473,16 @@ final class MqttClient {
 
   void _onConnected(MqttConnackPacket connack) {
     _connected = true;
+    _sessionPresent = connack.sessionPresent;
     logger.log(
       MqttLogLevel.info,
       'Connected (sessionPresent=${connack.sessionPresent})',
     );
+    if (connack.sessionPresent) {
+      _resumeSession();
+    } else {
+      _discardSession();
+    }
   }
 
   void _onConnectionLost() {
@@ -476,24 +493,114 @@ final class MqttClient {
     }
     _failPending(_pendingSubscribes);
     _failPending(_pendingUnsubscribes);
-    _failInflightPublishes();
-    _packetIds.reset();
   }
 
-  void _failInflightPublishes() {
-    for (final entry in _outgoingQos1.entries.toList()) {
-      if (!entry.completer.isCompleted) {
-        entry.completer.completeError(MqttConnectionException('Connection lost'));
+  /// Resumes the session after the broker reported it was present: retransmit
+  /// unacknowledged PUBLISH packets (DUP=1) and outstanding PUBREL packets.
+  void _resumeSession() {
+    for (final entry in _session.outgoingQos1.entries) {
+      entry.duplicate = true;
+      _connectionManager.send(
+        MqttPublishPacket(
+          topicName: entry.topic,
+          payload: entry.payload,
+          qos: MqttQos.atLeastOnce,
+          retain: entry.retain,
+          dup: true,
+          packetIdentifier: entry.packetIdentifier,
+          properties: entry.properties,
+        ),
+      );
+    }
+    for (final entry in _session.outgoingQos2.entries) {
+      switch (entry.state) {
+        case OutgoingQos2State.publishSent:
+          entry.duplicate = true;
+          _connectionManager.send(
+            MqttPublishPacket(
+              topicName: entry.topic,
+              payload: entry.payload,
+              qos: MqttQos.exactlyOnce,
+              retain: entry.retain,
+              dup: true,
+              packetIdentifier: entry.packetIdentifier,
+              properties: entry.properties,
+            ),
+          );
+        case OutgoingQos2State.pubRecReceived:
+        case OutgoingQos2State.pubRelSent:
+          _connectionManager.send(
+            MqttPubrelPacket(packetIdentifier: entry.packetIdentifier),
+          );
       }
     }
-    _outgoingQos1.clear();
-    for (final entry in _outgoingQos2.entries.toList()) {
+  }
+
+  /// Discards the session (fresh session): fails in-flight publishes, resets
+  /// state, and re-subscribes to any known subscriptions.
+  void _discardSession({bool notify = true, bool clearSubscriptions = false}) {
+    for (final entry in _session.outgoingQos1.entries.toList()) {
       if (!entry.completer.isCompleted) {
-        entry.completer.completeError(MqttConnectionException('Connection lost'));
+        entry.completer.completeError(
+          MqttConnectionException('Session lost before acknowledgement'),
+        );
       }
     }
-    _outgoingQos2.clear();
-    _incomingQos2.clear();
+    for (final entry in _session.outgoingQos2.entries.toList()) {
+      if (!entry.completer.isCompleted) {
+        entry.completer.completeError(
+          MqttConnectionException('Session lost before acknowledgement'),
+        );
+      }
+    }
+    _session.outgoingQos1.clear();
+    _session.outgoingQos2.clear();
+    _session.incomingQos2.clear();
+    _session.packetIds.reset();
+
+    final subscriptions = clearSubscriptions
+        ? const <MqttSubscription>[]
+        : _session.subscriptions.all;
+    if (clearSubscriptions) {
+      _session.subscriptions.clear();
+    }
+    if (notify && subscriptions.isNotEmpty && _connected) {
+      _resubscribeAll(subscriptions);
+    }
+  }
+
+  /// Re-establishes subscriptions after the session was lost.
+  void _resubscribeAll(List<MqttSubscription> subscriptions) {
+    if (subscriptions.isEmpty) {
+      return;
+    }
+    logger.log(
+      MqttLogLevel.info,
+      'Re-subscribing to ${subscriptions.length} topic filter(s)',
+    );
+    // Fire and forget; failures surface in the log.
+    unawaited(_sendSubscribe(subscriptions));
+  }
+
+  Future<void> _sendSubscribe(List<MqttSubscription> subscriptions) async {
+    final packetIdentifier = await _session.packetIds.allocate();
+    final completer = Completer<MqttSubackPacket>();
+    _pendingSubscribes[packetIdentifier] = completer;
+    try {
+      _connectionManager.send(
+        MqttSubscribePacket(
+          packetIdentifier: packetIdentifier,
+          subscriptions: subscriptions,
+        ),
+      );
+      final suback = await completer.future;
+      _throwIfSubackRejected(suback);
+    } on MqttException catch (e) {
+      logger.log(MqttLogLevel.warning, 'Re-subscribe failed: $e');
+    } finally {
+      _pendingSubscribes.remove(packetIdentifier);
+      _session.packetIds.release(packetIdentifier);
+    }
   }
 
   void _failPending<T>(Map<int, Completer<T>> pending) {

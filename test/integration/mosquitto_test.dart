@@ -110,6 +110,64 @@ void main() {
       }
     });
 
+    test('session resume keeps subscription across reconnect', () async {
+      final port = await _freePort();
+      final broker = await _startBroker(port);
+
+      try {
+        final client = MqttClient(
+          host: '127.0.0.1',
+          port: port,
+          clientId: 'session-test',
+        );
+        final publisher = MqttClient(
+          host: '127.0.0.1',
+          port: port,
+          clientId: 'session-publisher',
+        );
+
+        await client.connect(
+          cleanStart: false,
+          keepAlive: const Duration(seconds: 5),
+          sessionExpiryInterval: const Duration(seconds: 30),
+        );
+        expect(client.sessionPresent, isFalse);
+
+        final messageFuture = client.messages.first;
+        await client.subscribe(
+          'session/topic',
+          options: const MqttSubscriptionOptions(qos: MqttQos.atLeastOnce),
+        );
+
+        // Graceful disconnect keeps the session on the broker.
+        await client.disconnect();
+
+        await publisher.connect();
+        await publisher.publish(
+          'session/topic',
+          utf8.encode('while-offline'),
+          qos: MqttQos.atLeastOnce,
+        );
+        await publisher.disconnect();
+
+        await client.connect(
+          cleanStart: false,
+          keepAlive: const Duration(seconds: 5),
+          sessionExpiryInterval: const Duration(seconds: 30),
+        );
+        expect(client.sessionPresent, isTrue);
+
+        // The queued message must be delivered because the subscription and
+        // QoS1 state survived the reconnect.
+        final message = await messageFuture.timeout(const Duration(seconds: 5));
+        expect(utf8.decode(message.payload), 'while-offline');
+
+        await client.disconnect();
+      } finally {
+        broker.kill();
+      }
+    });
+
     test('reconnect after broker restart', () async {
       final port = await _freePort();
       var broker = await _startBroker(port);
