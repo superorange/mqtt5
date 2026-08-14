@@ -24,6 +24,7 @@ import '../property/mqtt_property.dart';
 import '../session/mqtt_session.dart';
 import '../session/outgoing_qos1.dart';
 import '../session/outgoing_qos2.dart';
+import '../session/topic_alias.dart';
 import '../subscription.dart';
 import '../transport/mqtt_transport.dart';
 import '../transport/tcp_transport.dart';
@@ -94,8 +95,11 @@ final class MqttClient {
 
   final ServerCapabilities _capabilities = ServerCapabilities();
   final FlowController _flow = FlowController();
+  final TopicAliasMap _outgoingAliases = TopicAliasMap();
+  final TopicAliasMap _incomingAliases = TopicAliasMap();
   int _clientReceiveMaximum = 65535;
   int _clientMaximumPacketSize = 268435455;
+  int _clientTopicAliasMaximum = 0;
 
   // Connect settings, retained for reconnect and rebuilds.
   bool _cleanStart = true;
@@ -122,6 +126,7 @@ final class MqttClient {
     Duration connackTimeout = const Duration(seconds: 10),
     int receiveMaximum = 65535,
     int maximumPacketSize = 268435455,
+    int topicAliasMaximum = 0,
   }) async {
     _cleanStart = cleanStart;
     _keepAlive = keepAlive;
@@ -129,6 +134,7 @@ final class MqttClient {
     _connectProperties = properties;
     _clientReceiveMaximum = receiveMaximum;
     _clientMaximumPacketSize = maximumPacketSize;
+    _clientTopicAliasMaximum = topicAliasMaximum;
     _connectionManager.connackTimeout = connackTimeout;
     _connectionManager.clientMaximumPacketSize = maximumPacketSize;
 
@@ -163,7 +169,9 @@ final class MqttClient {
   Future<void> subscribe(
     String topicFilter, {
     MqttSubscriptionOptions options = const MqttSubscriptionOptions(),
+    int? subscriptionIdentifier,
   }) async {
+    _validateSubscriptionTopic(topicFilter);
     final packetIdentifier = await _session.packetIds.allocate();
     final completer = Completer<MqttSubackPacket>();
     _pendingSubscribes[packetIdentifier] = completer;
@@ -172,6 +180,10 @@ final class MqttClient {
         MqttSubscribePacket(
           packetIdentifier: packetIdentifier,
           subscriptions: [MqttSubscription(topicFilter, options: options)],
+          properties: [
+            if (subscriptionIdentifier != null)
+              SubscriptionIdentifier(subscriptionIdentifier),
+          ],
         ),
       );
       final suback = await completer.future;
@@ -184,9 +196,15 @@ final class MqttClient {
   }
 
   /// Subscribes to multiple topic filters in a single SUBSCRIBE packet.
-  Future<void> subscribeAll(List<MqttSubscription> subscriptions) async {
+  Future<void> subscribeAll(
+    List<MqttSubscription> subscriptions, {
+    int? subscriptionIdentifier,
+  }) async {
     if (subscriptions.isEmpty) {
       return;
+    }
+    for (final subscription in subscriptions) {
+      _validateSubscriptionTopic(subscription.topicFilter);
     }
     final packetIdentifier = await _session.packetIds.allocate();
     final completer = Completer<MqttSubackPacket>();
@@ -196,6 +214,10 @@ final class MqttClient {
         MqttSubscribePacket(
           packetIdentifier: packetIdentifier,
           subscriptions: subscriptions,
+          properties: [
+            if (subscriptionIdentifier != null)
+              SubscriptionIdentifier(subscriptionIdentifier),
+          ],
         ),
       );
       final suback = await completer.future;
@@ -206,6 +228,21 @@ final class MqttClient {
     } finally {
       _pendingSubscribes.remove(packetIdentifier);
       _session.packetIds.release(packetIdentifier);
+    }
+  }
+
+  void _validateSubscriptionTopic(String topicFilter) {
+    if (topicFilter.startsWith(r'$share/') &&
+        !_capabilities.sharedSubscriptionAvailable) {
+      throw MqttFlowControlException(
+        'Shared subscriptions are not supported by the server',
+      );
+    }
+    if ((topicFilter.contains('+') || topicFilter.contains('#')) &&
+        !_capabilities.wildcardSubscriptionAvailable) {
+      throw MqttFlowControlException(
+        'Wildcard subscriptions are not supported by the server',
+      );
     }
   }
 
@@ -266,13 +303,14 @@ final class MqttClient {
     }
     switch (qos) {
       case MqttQos.atMostOnce:
+        final aliased = _applyOutgoingAlias(topic, properties);
         _connectionManager.send(
           MqttPublishPacket(
-            topicName: topic,
+            topicName: aliased.topic,
             payload: payload,
             qos: qos,
             retain: retain,
-            properties: properties,
+            properties: aliased.properties,
           ),
         );
         return const MqttPublishResult();
@@ -281,6 +319,29 @@ final class MqttClient {
       case MqttQos.exactlyOnce:
         return _publishQos2(topic, payload, retain: retain, properties: properties);
     }
+  }
+
+  /// Applies the client-to-server Topic Alias mapping to an outgoing publish.
+  ///
+  /// Returns the possibly-aliased topic name and the properties to send. The
+  /// entry's stored topic/properties are always the original values so a
+  /// retransmit after reconnect uses the full topic name.
+  ({String topic, List<MqttProperty> properties}) _applyOutgoingAlias(
+    String topic,
+    List<MqttProperty> properties,
+  ) {
+    if (properties.any((p) => p is TopicAlias)) {
+      return (topic: topic, properties: properties);
+    }
+    final existing = _outgoingAliases.aliasFor(topic);
+    if (existing != null) {
+      return (topic: '', properties: [...properties, TopicAlias(existing)]);
+    }
+    final assigned = _outgoingAliases.assign(topic);
+    if (assigned != null) {
+      return (topic: topic, properties: [...properties, TopicAlias(assigned)]);
+    }
+    return (topic: topic, properties: properties);
   }
 
   Future<MqttPublishResult> _publishQos1(
@@ -300,14 +361,15 @@ final class MqttClient {
     );
     _session.outgoingQos1.put(entry);
     try {
+      final aliased = _applyOutgoingAlias(topic, properties);
       _connectionManager.send(
         MqttPublishPacket(
-          topicName: topic,
+          topicName: aliased.topic,
           payload: payload,
           qos: MqttQos.atLeastOnce,
           retain: retain,
           packetIdentifier: packetIdentifier,
-          properties: properties,
+          properties: aliased.properties,
         ),
       );
       return await entry.completer.future;
@@ -334,14 +396,15 @@ final class MqttClient {
     );
     _session.outgoingQos2.put(entry);
     try {
+      final aliased = _applyOutgoingAlias(topic, properties);
       _connectionManager.send(
         MqttPublishPacket(
-          topicName: topic,
+          topicName: aliased.topic,
           payload: payload,
           qos: MqttQos.exactlyOnce,
           retain: retain,
           packetIdentifier: packetIdentifier,
-          properties: properties,
+          properties: aliased.properties,
         ),
       );
       return await entry.completer.future;
@@ -400,23 +463,51 @@ final class MqttClient {
   }
 
   void _handlePublish(MqttPublishPacket publish) {
+    final topic = _resolveIncomingTopic(publish);
     switch (publish.qos) {
       case MqttQos.atMostOnce:
-        _deliver(publish);
+        _deliver(publish, topic);
       case MqttQos.atLeastOnce:
-        _deliver(publish);
+        _deliver(publish, topic);
         _connectionManager.send(
           MqttPubackPacket(packetIdentifier: publish.packetIdentifier),
         );
       case MqttQos.exactlyOnce:
-        _handleIncomingQos2(publish);
+        _handleIncomingQos2(publish, topic);
     }
   }
 
-  void _handleIncomingQos2(MqttPublishPacket publish) {
+  /// Resolves the effective topic name of an incoming PUBLISH, applying the
+  /// server-to-client Topic Alias mapping.
+  String _resolveIncomingTopic(MqttPublishPacket publish) {
+    TopicAlias? aliasProperty;
+    for (final property in publish.properties) {
+      if (property is TopicAlias) {
+        aliasProperty = property;
+        break;
+      }
+    }
+    if (aliasProperty == null) {
+      return publish.topicName;
+    }
+    final alias = aliasProperty.value;
+    if (publish.topicName.isNotEmpty) {
+      _incomingAliases.register(alias, publish.topicName);
+      return publish.topicName;
+    }
+    final topic = _incomingAliases.resolve(alias);
+    if (topic == null) {
+      throw MqttProtocolException(
+        'PUBLISH used unknown topic alias $alias',
+      );
+    }
+    return topic;
+  }
+
+  void _handleIncomingQos2(MqttPublishPacket publish, String topic) {
     final isNew = _session.incomingQos2.add(publish.packetIdentifier);
     if (isNew) {
-      _deliver(publish);
+      _deliver(publish, topic);
     }
     _connectionManager.send(
       MqttPubrecPacket(packetIdentifier: publish.packetIdentifier),
@@ -486,10 +577,10 @@ final class MqttClient {
     );
   }
 
-  void _deliver(MqttPublishPacket publish) {
+  void _deliver(MqttPublishPacket publish, String topic) {
     _messages.add(
       MqttMessage(
-        topic: publish.topicName,
+        topic: topic,
         payload: publish.payload,
         qos: publish.qos,
         retain: publish.retain,
@@ -541,6 +632,10 @@ final class MqttClient {
     }
     _flow.receiveMaximum = _capabilities.receiveMaximum;
     _connectionManager.maximumPacketSize = _capabilities.maximumPacketSize;
+    _outgoingAliases.maximum = _capabilities.topicAliasMaximum;
+    _incomingAliases.maximum = _clientTopicAliasMaximum;
+    _outgoingAliases.reset();
+    _incomingAliases.reset();
   }
 
   void _onConnectionLost() {
@@ -703,6 +798,8 @@ final class MqttClient {
           ReceiveMaximum(_clientReceiveMaximum),
         if (_clientMaximumPacketSize != 268435455)
           MaximumPacketSize(_clientMaximumPacketSize),
+        if (_clientTopicAliasMaximum != 0)
+          TopicAliasMaximum(_clientTopicAliasMaximum),
         ..._connectProperties,
       ],
       will: will,

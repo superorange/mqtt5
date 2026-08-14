@@ -223,16 +223,24 @@ final class ConnectionManager {
     if (!_running) {
       return;
     }
-    final packets = _decoder.feed(data);
-    for (final packet in packets) {
-      if (_handleHandshakePacket(packet)) {
-        continue;
+    try {
+      final packets = _decoder.feed(data);
+      for (final packet in packets) {
+        if (_handleHandshakePacket(packet)) {
+          continue;
+        }
+        if (packet is MqttPingrespPacket) {
+          _keepAlive.onPingResponse();
+          continue;
+        }
+        onPacket(packet);
       }
-      if (packet is MqttPingrespPacket) {
-        _keepAlive.onPingResponse();
-        continue;
-      }
-      onPacket(packet);
+    } on MqttException catch (e) {
+      logger.log(MqttLogLevel.error, 'Protocol error, closing connection: $e');
+      _teardownTransport();
+      _keepAlive.stop();
+      onConnectionLost();
+      unawaited(_run());
     }
   }
 

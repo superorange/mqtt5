@@ -20,4 +20,11 @@ final class MqttMessage {
   final bool retain;
   final bool duplicate;
   final List<MqttProperty> properties;
+
+  /// The subscription identifiers attached to this message, in the order they
+  /// appeared in the PUBLISH packet.
+  List<int> get subscriptionIdentifiers => [
+        for (final property in properties)
+          if (property is SubscriptionIdentifier) property.value,
+      ];
 }

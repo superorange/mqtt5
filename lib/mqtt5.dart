@@ -38,6 +38,7 @@ export 'src/session/outgoing_qos1.dart';
 export 'src/session/outgoing_qos2.dart';
 export 'src/session/packet_identifier_pool.dart';
 export 'src/session/subscription_store.dart';
+export 'src/session/topic_alias.dart';
 export 'src/subscription.dart';
 export 'src/transport/memory_transport.dart';
 export 'src/transport/mqtt_transport.dart';
