@@ -13,6 +13,8 @@ import '../packet/mqtt_reason_code.dart';
 import '../packet/pingreq.dart';
 import '../packet/pingresp.dart';
 import '../property/mqtt_property.dart';
+import 'dart:typed_data';
+import 'mqtt_metrics.dart';
 import '../transport/mqtt_transport.dart';
 import 'keep_alive_manager.dart';
 import 'mqtt_authenticator.dart';
@@ -64,6 +66,8 @@ final class ConnectionManager {
   MqttAuthenticator? authenticator;
 
   final MqttLogger logger;
+  final MqttMetrics metrics = MqttMetrics();
+  DateTime? _pingSentAt;
   final ReconnectManager _reconnect;
 
   MqttTransport? _transport;
@@ -144,6 +148,8 @@ final class ConnectionManager {
       );
     }
     transport.add(bytes);
+    metrics.bytesSent += bytes.length;
+    metrics.packetsSent++;
     _keepAlive.onOutboundActivity();
   }
 
@@ -174,6 +180,7 @@ final class ConnectionManager {
           }
           await _teardownTransport();
           _setState(MqttConnectionState.reconnecting);
+          metrics.reconnectCount++;
           final delay = _reconnect.nextDelay();
           logger.log(
             MqttLogLevel.warning,
@@ -320,17 +327,23 @@ final class ConnectionManager {
     }
   }
 
-  void _onData(dynamic data) {
+  void _onData(Uint8List data) {
     if (!_running) {
       return;
     }
+    metrics.bytesReceived += data.length;
     try {
       final packets = _decoder.feed(data);
+      metrics.packetsReceived += packets.length;
       for (final packet in packets) {
         if (_handleHandshakePacket(packet)) {
           continue;
         }
         if (packet is MqttPingrespPacket) {
+          final sentAt = _pingSentAt;
+          if (sentAt != null) {
+            metrics.lastPingRtt = DateTime.now().difference(sentAt);
+          }
           _keepAlive.onPingResponse();
           continue;
         }
@@ -341,6 +354,7 @@ final class ConnectionManager {
         onPacket(packet);
       }
     } on MqttException catch (e) {
+      metrics.protocolErrorCount++;
       logger.log(MqttLogLevel.error, 'Protocol error, closing connection: $e');
       _teardownTransport();
       _keepAlive.stop();
@@ -414,6 +428,7 @@ final class ConnectionManager {
 
   void _onPingRequired() {
     try {
+      _pingSentAt = DateTime.now();
       _write(const MqttPingreqPacket());
     } on MqttException catch (e) {
       logger.log(MqttLogLevel.warning, 'Failed to send PINGREQ: $e');

@@ -8,6 +8,7 @@ export 'src/client/mqtt_authenticator.dart';
 export 'src/client/mqtt_client.dart';
 export 'src/client/mqtt_connection_state.dart';
 export 'src/client/mqtt_message.dart';
+export 'src/client/mqtt_metrics.dart';
 export 'src/client/mqtt_publish_result.dart';
 export 'src/client/reconnect_manager.dart';
 export 'src/codec/mqtt_packet_decoder.dart';

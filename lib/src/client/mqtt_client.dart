@@ -34,6 +34,7 @@ import 'flow_controller.dart';
 import 'mqtt_authenticator.dart';
 import 'mqtt_connection_state.dart';
 import 'mqtt_message.dart';
+import 'mqtt_metrics.dart';
 import 'mqtt_publish_result.dart';
 import 'reconnect_manager.dart';
 import 'server_capabilities.dart';
@@ -122,6 +123,12 @@ final class MqttClient {
   /// Invoked when the broker reports it has moved to another server.
   void Function(String? serverReference, MqttReasonCode reasonCode)?
       onServerMoved;
+
+  /// Runtime diagnostics counters.
+  MqttMetrics get metrics => _connectionManager.metrics;
+
+  /// The number of QoS 1/2 publications currently awaiting acknowledgement.
+  int get inflightCount => _session.inflightCount;
 
   /// Incoming application messages.
   Stream<MqttMessage> get messages => _messages.stream;
@@ -305,6 +312,7 @@ final class MqttClient {
     bool retain = false,
     List<MqttProperty> properties = const [],
   }) async {
+    metrics.messagesPublished++;
     if (qos.value > _capabilities.maximumQos) {
       throw MqttFlowControlException(
         'The server only supports maximum QoS ${_capabilities.maximumQos}',
@@ -604,6 +612,7 @@ final class MqttClient {
   }
 
   void _deliver(MqttPublishPacket publish, String topic) {
+    metrics.messagesReceived++;
     _messages.add(
       MqttMessage(
         topic: topic,

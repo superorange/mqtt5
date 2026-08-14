@@ -1,7 +1,6 @@
 name: mqtt5
-description: A sample command-line application.
-version: 1.0.0
-# repository: https://github.com/my_org/my_repo
+description: A pure-Dart MQTT 5.0 client library with QoS 0/1/2, session resume, flow control and enhanced authentication.
+version: 0.1.0
 
 environment:
   sdk: ^3.12.2
