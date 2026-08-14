@@ -29,10 +29,12 @@ import '../transport/mqtt_transport.dart';
 import '../transport/tcp_transport.dart';
 import '../transport/tls_transport.dart';
 import 'connection_manager.dart';
+import 'flow_controller.dart';
 import 'mqtt_connection_state.dart';
 import 'mqtt_message.dart';
 import 'mqtt_publish_result.dart';
 import 'reconnect_manager.dart';
+import 'server_capabilities.dart';
 
 /// A pure-Dart MQTT 5.0 client.
 final class MqttClient {
@@ -90,6 +92,11 @@ final class MqttClient {
   bool _connected = false;
   bool _sessionPresent = false;
 
+  final ServerCapabilities _capabilities = ServerCapabilities();
+  final FlowController _flow = FlowController();
+  int _clientReceiveMaximum = 65535;
+  int _clientMaximumPacketSize = 268435455;
+
   // Connect settings, retained for reconnect and rebuilds.
   bool _cleanStart = true;
   Duration _keepAlive = const Duration(seconds: 60);
@@ -113,12 +120,17 @@ final class MqttClient {
     Duration? sessionExpiryInterval,
     List<MqttProperty> properties = const [],
     Duration connackTimeout = const Duration(seconds: 10),
+    int receiveMaximum = 65535,
+    int maximumPacketSize = 268435455,
   }) async {
     _cleanStart = cleanStart;
     _keepAlive = keepAlive;
     _sessionExpiryInterval = sessionExpiryInterval;
     _connectProperties = properties;
+    _clientReceiveMaximum = receiveMaximum;
+    _clientMaximumPacketSize = maximumPacketSize;
     _connectionManager.connackTimeout = connackTimeout;
+    _connectionManager.clientMaximumPacketSize = maximumPacketSize;
 
     if (cleanStart) {
       _discardSession(notify: false, clearSubscriptions: true);
@@ -141,6 +153,7 @@ final class MqttClient {
     } on MqttException catch (e) {
       logger.log(MqttLogLevel.debug, 'DISCONNECT send failed: $e');
     }
+    _flow.reset();
     await _connectionManager.stop();
   }
 
@@ -241,6 +254,16 @@ final class MqttClient {
     bool retain = false,
     List<MqttProperty> properties = const [],
   }) async {
+    if (qos.value > _capabilities.maximumQos) {
+      throw MqttFlowControlException(
+        'The server only supports maximum QoS ${_capabilities.maximumQos}',
+      );
+    }
+    if (retain && !_capabilities.retainAvailable) {
+      throw MqttFlowControlException(
+        'The server does not support retained messages',
+      );
+    }
     switch (qos) {
       case MqttQos.atMostOnce:
         _connectionManager.send(
@@ -266,6 +289,7 @@ final class MqttClient {
     required bool retain,
     required List<MqttProperty> properties,
   }) async {
+    await _flow.acquire();
     final packetIdentifier = await _session.packetIds.allocate();
     final entry = OutgoingQos1Entry(
       packetIdentifier: packetIdentifier,
@@ -299,6 +323,7 @@ final class MqttClient {
     required bool retain,
     required List<MqttProperty> properties,
   }) async {
+    await _flow.acquire();
     final packetIdentifier = await _session.packetIds.allocate();
     final entry = OutgoingQos2Entry(
       packetIdentifier: packetIdentifier,
@@ -404,6 +429,7 @@ final class MqttClient {
       return;
     }
     _session.packetIds.release(puback.packetIdentifier);
+    _flow.release();
     entry.completer.complete(
       MqttPublishResult(
         reasonCode: puback.reasonCode ?? MqttReasonCode.success,
@@ -421,6 +447,7 @@ final class MqttClient {
     if (reasonCode != null && reasonCode.value >= 0x80) {
       _session.outgoingQos2.remove(pubrec.packetIdentifier);
       _session.packetIds.release(pubrec.packetIdentifier);
+      _flow.release();
       entry.completer.complete(
         MqttPublishResult(reasonCode: reasonCode, properties: pubrec.properties),
       );
@@ -450,6 +477,7 @@ final class MqttClient {
       return;
     }
     _session.packetIds.release(pubcomp.packetIdentifier);
+    _flow.release();
     entry.completer.complete(
       MqttPublishResult(
         reasonCode: pubcomp.reasonCode ?? MqttReasonCode.success,
@@ -474,15 +502,45 @@ final class MqttClient {
   void _onConnected(MqttConnackPacket connack) {
     _connected = true;
     _sessionPresent = connack.sessionPresent;
+    _applyServerCapabilities(connack);
     logger.log(
       MqttLogLevel.info,
       'Connected (sessionPresent=${connack.sessionPresent})',
     );
     if (connack.sessionPresent) {
-      _resumeSession();
+      unawaited(_resumeSession());
     } else {
       _discardSession();
     }
+  }
+
+  void _applyServerCapabilities(MqttConnackPacket connack) {
+    for (final property in connack.properties) {
+      switch (property) {
+        case ReceiveMaximum receiveMaximum:
+          _capabilities.receiveMaximum = receiveMaximum.value;
+        case MaximumPacketSize maximumPacketSize:
+          _capabilities.maximumPacketSize = maximumPacketSize.value;
+        case MaximumQos maximumQos:
+          _capabilities.maximumQos = maximumQos.value;
+        case RetainAvailable retainAvailable:
+          _capabilities.retainAvailable = retainAvailable.value == 1;
+        case TopicAliasMaximum topicAliasMaximum:
+          _capabilities.topicAliasMaximum = topicAliasMaximum.value;
+        case WildcardSubscriptionAvailable wildcard:
+          _capabilities.wildcardSubscriptionAvailable = wildcard.value == 1;
+        case SubscriptionIdentifierAvailable subId:
+          _capabilities.subscriptionIdentifierAvailable = subId.value == 1;
+        case SharedSubscriptionAvailable shared:
+          _capabilities.sharedSubscriptionAvailable = shared.value == 1;
+        case RequestResponseInformation requestResponse:
+          _capabilities.requestResponseInformation = requestResponse.value == 1;
+        default:
+          break;
+      }
+    }
+    _flow.receiveMaximum = _capabilities.receiveMaximum;
+    _connectionManager.maximumPacketSize = _capabilities.maximumPacketSize;
   }
 
   void _onConnectionLost() {
@@ -493,12 +551,14 @@ final class MqttClient {
     }
     _failPending(_pendingSubscribes);
     _failPending(_pendingUnsubscribes);
+    _flow.reset();
   }
 
   /// Resumes the session after the broker reported it was present: retransmit
   /// unacknowledged PUBLISH packets (DUP=1) and outstanding PUBREL packets.
-  void _resumeSession() {
+  Future<void> _resumeSession() async {
     for (final entry in _session.outgoingQos1.entries) {
+      await _flow.acquire();
       entry.duplicate = true;
       _connectionManager.send(
         MqttPublishPacket(
@@ -513,25 +573,24 @@ final class MqttClient {
       );
     }
     for (final entry in _session.outgoingQos2.entries) {
-      switch (entry.state) {
-        case OutgoingQos2State.publishSent:
-          entry.duplicate = true;
-          _connectionManager.send(
-            MqttPublishPacket(
-              topicName: entry.topic,
-              payload: entry.payload,
-              qos: MqttQos.exactlyOnce,
-              retain: entry.retain,
-              dup: true,
-              packetIdentifier: entry.packetIdentifier,
-              properties: entry.properties,
-            ),
-          );
-        case OutgoingQos2State.pubRecReceived:
-        case OutgoingQos2State.pubRelSent:
-          _connectionManager.send(
-            MqttPubrelPacket(packetIdentifier: entry.packetIdentifier),
-          );
+      await _flow.acquire();
+      if (entry.state == OutgoingQos2State.publishSent) {
+        entry.duplicate = true;
+        _connectionManager.send(
+          MqttPublishPacket(
+            topicName: entry.topic,
+            payload: entry.payload,
+            qos: MqttQos.exactlyOnce,
+            retain: entry.retain,
+            dup: true,
+            packetIdentifier: entry.packetIdentifier,
+            properties: entry.properties,
+          ),
+        );
+      } else {
+        _connectionManager.send(
+          MqttPubrelPacket(packetIdentifier: entry.packetIdentifier),
+        );
       }
     }
   }
@@ -557,6 +616,7 @@ final class MqttClient {
     _session.outgoingQos2.clear();
     _session.incomingQos2.clear();
     _session.packetIds.reset();
+    _flow.reset();
 
     final subscriptions = clearSubscriptions
         ? const <MqttSubscription>[]
@@ -639,6 +699,10 @@ final class MqttClient {
       properties: [
         if (_sessionExpiryInterval != null)
           SessionExpiryInterval(_sessionExpiryInterval!.inSeconds),
+        if (_clientReceiveMaximum != 65535)
+          ReceiveMaximum(_clientReceiveMaximum),
+        if (_clientMaximumPacketSize != 268435455)
+          MaximumPacketSize(_clientMaximumPacketSize),
         ..._connectProperties,
       ],
       will: will,

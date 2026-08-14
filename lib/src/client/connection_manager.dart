@@ -41,6 +41,13 @@ final class ConnectionManager {
   final void Function() onConnectionLost;
 
   Duration connackTimeout;
+
+  /// The maximum packet size the client may send (from the server CONNACK).
+  int maximumPacketSize = 268435455;
+
+  /// The maximum packet size the client will accept (declared in CONNECT).
+  int clientMaximumPacketSize = 268435455;
+
   final MqttLogger logger;
   final ReconnectManager _reconnect;
 
@@ -114,7 +121,14 @@ final class ConnectionManager {
     if (transport == null) {
       return;
     }
-    transport.add(MqttPacketCodec.encode(packet));
+    final bytes = MqttPacketCodec.encode(packet);
+    if (bytes.length > maximumPacketSize) {
+      throw MqttPacketTooLargeException(
+        'Packet of ${bytes.length} bytes exceeds the server maximum '
+        'packet size of $maximumPacketSize',
+      );
+    }
+    transport.add(bytes);
     _keepAlive.onOutboundActivity();
   }
 
@@ -161,7 +175,7 @@ final class ConnectionManager {
     final transport = transportFactory();
     await transport.connect();
     _transport = transport;
-    _decoder = MqttPacketDecoder();
+    _decoder = MqttPacketDecoder(maximumPacketSize: clientMaximumPacketSize);
     _incomingSub = transport.incoming.listen(
       _onData,
       onError: (Object error) => _onTransportError(error),
