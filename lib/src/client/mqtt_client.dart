@@ -372,8 +372,8 @@ final class MqttClient {
     required bool retain,
     required List<MqttProperty> properties,
   }) async {
-    await _flow.acquire();
     final packetIdentifier = await _session.packetIds.allocate();
+    await _flow.acquire();
     final entry = OutgoingQos1Entry(
       packetIdentifier: packetIdentifier,
       topic: topic,
@@ -395,6 +395,9 @@ final class MqttClient {
         ),
       );
       return await entry.completer.future;
+    } catch (_) {
+      _flow.release();
+      rethrow;
     } finally {
       _session.outgoingQos1.remove(packetIdentifier);
       _session.packetIds.release(packetIdentifier);
@@ -407,8 +410,8 @@ final class MqttClient {
     required bool retain,
     required List<MqttProperty> properties,
   }) async {
-    await _flow.acquire();
     final packetIdentifier = await _session.packetIds.allocate();
+    await _flow.acquire();
     final entry = OutgoingQos2Entry(
       packetIdentifier: packetIdentifier,
       topic: topic,
@@ -430,6 +433,9 @@ final class MqttClient {
         ),
       );
       return await entry.completer.future;
+    } catch (_) {
+      _flow.release();
+      rethrow;
     } finally {
       _session.outgoingQos2.remove(packetIdentifier);
       _session.packetIds.release(packetIdentifier);
@@ -821,11 +827,19 @@ final class MqttClient {
     return TcpTransport(host: host, port: port, timeout: connectionTimeout);
   }
 
+  int get _keepAliveSeconds {
+    if (_keepAlive <= Duration.zero) {
+      return 0;
+    }
+    final seconds = _keepAlive.inSeconds;
+    return seconds == 0 ? 1 : seconds;
+  }
+
   MqttConnectPacket _buildConnectPacket() {
     return MqttConnectPacket(
       clientId: clientId,
       cleanStart: _cleanStart,
-      keepAliveSeconds: _keepAlive.inSeconds,
+      keepAliveSeconds: _keepAliveSeconds,
       properties: [
         if (_sessionExpiryInterval != null)
           SessionExpiryInterval(_sessionExpiryInterval!.inSeconds),

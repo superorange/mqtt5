@@ -1,6 +1,7 @@
 name: mqtt5
 description: A pure-Dart MQTT 5.0 client library with QoS 0/1/2, session resume, flow control and enhanced authentication.
 version: 0.1.0
+repository: https://github.com/superorange/mqtt5
 
 environment:
   sdk: ^3.12.2
@@ -12,3 +13,9 @@ dependencies:
 dev_dependencies:
   lints: ^6.1.0
   test: ^1.31.2
+
+topics:
+  - iot
+  - mqtt
+  - networking
+  - socket

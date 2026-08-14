@@ -2,5 +2,11 @@
 # Created by `dart pub`
 .dart_tool/
 
+# Library packages should not commit the lockfile.
+pubspec.lock
+
+# Internal design notes, not part of the package.
+goal.md
+
 # IDE configuration
 .idea/
