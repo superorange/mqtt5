@@ -2,7 +2,9 @@
 library;
 
 export 'src/client/connection_manager.dart';
+export 'src/client/flow_controller.dart';
 export 'src/client/keep_alive_manager.dart';
+export 'src/client/mqtt_authenticator.dart';
 export 'src/client/mqtt_client.dart';
 export 'src/client/mqtt_connection_state.dart';
 export 'src/client/mqtt_message.dart';

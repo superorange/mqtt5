@@ -39,6 +39,19 @@ class MqttAuthenticationException extends MqttException {
   MqttAuthenticationException(super.message, [super.cause]);
 }
 
+/// The server asked the client to connect to another server, or reported that
+/// it has moved.
+class MqttServerMovedException extends MqttException {
+  MqttServerMovedException(this.reasonCode, this.serverReference, [Object? cause])
+      : super(
+          'Server requested connection to another server: $serverReference',
+          cause,
+        );
+
+  final int reasonCode;
+  final String? serverReference;
+}
+
 /// An exception thrown when the server rejects a request with a
 /// [MqttReasonCode].
 class MqttServerRejectedException extends MqttException {

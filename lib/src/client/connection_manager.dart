@@ -3,6 +3,7 @@ import 'dart:async';
 import '../codec/mqtt_packet_decoder.dart';
 import '../exception/mqtt_exception.dart';
 import '../logging/mqtt_logger.dart';
+import '../packet/auth.dart';
 import '../packet/connack.dart';
 import '../packet/connect.dart';
 import '../packet/disconnect.dart';
@@ -14,8 +15,19 @@ import '../packet/pingresp.dart';
 import '../property/mqtt_property.dart';
 import '../transport/mqtt_transport.dart';
 import 'keep_alive_manager.dart';
+import 'mqtt_authenticator.dart';
 import 'mqtt_connection_state.dart';
 import 'reconnect_manager.dart';
+
+/// CONNACK reason codes that warrant a retry rather than surfacing an error.
+const Set<int> retryableConnackReasonCodes = {
+  0x80, // Unspecified error
+  0x83, // Implementation specific error
+  0x88, // Server unavailable
+  0x89, // Server busy
+  0x97, // Quota exceeded
+  0x9F, // Connection rate exceeded
+};
 
 /// Manages the transport lifecycle: connecting, the CONNECT/CONNACK
 /// handshake, the inbound packet loop, keep alive and reconnection.
@@ -47,6 +59,9 @@ final class ConnectionManager {
 
   /// The maximum packet size the client will accept (declared in CONNECT).
   int clientMaximumPacketSize = 268435455;
+
+  /// Handles enhanced authentication challenges. Set before [start].
+  MqttAuthenticator? authenticator;
 
   final MqttLogger logger;
   final ReconnectManager _reconnect;
@@ -153,6 +168,10 @@ final class ConnectionManager {
           if (!_running) {
             break;
           }
+          if (_isFatal(e)) {
+            _setState(MqttConnectionState.disconnected);
+            rethrow;
+          }
           await _teardownTransport();
           _setState(MqttConnectionState.reconnecting);
           final delay = _reconnect.nextDelay();
@@ -167,6 +186,17 @@ final class ConnectionManager {
     } finally {
       _runActive = false;
     }
+  }
+
+  bool _isFatal(Object error) {
+    if (error is MqttServerMovedException ||
+        error is MqttAuthenticationException) {
+      return true;
+    }
+    if (error is MqttServerRejectedException) {
+      return !retryableConnackReasonCodes.contains(error.reasonCode);
+    }
+    return false;
   }
 
   MqttConnackPacket? _lastConnack;
@@ -189,18 +219,22 @@ final class ConnectionManager {
     _connackCompleter = Completer<MqttConnackPacket>();
     _connackTimer = Timer(connackTimeout, _onConnackTimeout);
     _write(connectPacket);
-
-    final connack = await _connackCompleter!.future;
+    var connack = await _connackCompleter!.future;
     _connackTimer?.cancel();
     _connackTimer = null;
     _lastConnack = connack;
 
-    if (connack.reasonCode != MqttReasonCode.success) {
-      throw MqttServerRejectedException(
-        connack.reasonCode.value,
-        'Server rejected connection: ${connack.reasonCode.name}',
-      );
+    while (connack.reasonCode == MqttReasonCode.continueAuthentication) {
+      await _continueAuthentication(connack, connectPacket);
+      _connackCompleter = Completer<MqttConnackPacket>();
+      _connackTimer = Timer(connackTimeout, _onConnackTimeout);
+      connack = await _connackCompleter!.future;
+      _connackTimer?.cancel();
+      _connackTimer = null;
+      _lastConnack = connack;
     }
+
+    _failOnRejection(connack);
 
     _keepAlive.start(Duration(seconds: connectPacket.keepAliveSeconds));
     for (final property in connack.properties) {
@@ -208,6 +242,73 @@ final class ConnectionManager {
         _keepAlive.updateKeepAlive(Duration(seconds: property.seconds));
       }
     }
+  }
+
+  Future<void> _continueAuthentication(
+    MqttConnackPacket connack,
+    MqttConnectPacket connectPacket,
+  ) async {
+    final authenticator = this.authenticator;
+    if (authenticator == null) {
+      throw MqttAuthenticationException(
+        'Server requested continued authentication but no authenticator '
+        'is configured',
+      );
+    }
+    final method = _propertyOf<AuthenticationMethod>(connack)?.value ??
+        _propertyOf<AuthenticationMethod>(connectPacket)?.value;
+    final data = _propertyOf<AuthenticationData>(connack)?.data;
+    final response = await authenticator.authenticate(
+      MqttAuthChallenge(method: method, data: data),
+    );
+    if (response == null) {
+      throw MqttAuthenticationException('Client aborted authentication');
+    }
+    _write(
+      MqttAuthPacket(
+        reasonCode: MqttReasonCode.continueAuthentication,
+        properties: [
+          if (method != null) AuthenticationMethod(method),
+          AuthenticationData(response.data),
+        ],
+      ),
+    );
+  }
+
+  void _failOnRejection(MqttConnackPacket connack) {
+    final reasonCode = connack.reasonCode;
+    if (reasonCode == MqttReasonCode.useAnotherServer ||
+        reasonCode == MqttReasonCode.serverMoved) {
+      throw MqttServerMovedException(
+        reasonCode.value,
+        _propertyOf<ServerReference>(connack)?.value,
+      );
+    }
+    if (reasonCode != MqttReasonCode.success) {
+      throw MqttServerRejectedException(
+        reasonCode.value,
+        'Server rejected connection: ${reasonCode.name}',
+      );
+    }
+  }
+
+  T? _propertyOf<T>(MqttPacket packet) {
+    List<MqttProperty> properties;
+    if (packet is MqttConnackPacket) {
+      properties = packet.properties;
+    } else if (packet is MqttConnectPacket) {
+      properties = packet.properties;
+    } else if (packet is MqttAuthPacket) {
+      properties = packet.properties;
+    } else {
+      return null;
+    }
+    for (final property in properties) {
+      if (property is T) {
+        return property as T;
+      }
+    }
+    return null;
   }
 
   void _onConnackTimeout() {
@@ -233,6 +334,10 @@ final class ConnectionManager {
           _keepAlive.onPingResponse();
           continue;
         }
+        if (packet is MqttAuthPacket) {
+          unawaited(_handleReAuth(packet));
+          continue;
+        }
         onPacket(packet);
       }
     } on MqttException catch (e) {
@@ -241,6 +346,39 @@ final class ConnectionManager {
       _keepAlive.stop();
       onConnectionLost();
       unawaited(_run());
+    }
+  }
+
+  Future<void> _handleReAuth(MqttAuthPacket auth) async {
+    final authenticator = this.authenticator;
+    if (authenticator == null) {
+      logger.log(
+        MqttLogLevel.error,
+        'Server sent AUTH but no authenticator is configured',
+      );
+      return;
+    }
+    if (auth.reasonCode == MqttReasonCode.reAuthenticate) {
+      final method = _propertyOf<AuthenticationMethod>(auth)?.value;
+      final data = _propertyOf<AuthenticationData>(auth)?.data;
+      final response = await authenticator.authenticate(
+        MqttAuthChallenge(method: method, data: data),
+      );
+      if (response == null) {
+        _write(
+          MqttDisconnectPacket(reasonCode: MqttReasonCode.notAuthorized),
+        );
+        return;
+      }
+      _write(
+        MqttAuthPacket(
+          reasonCode: MqttReasonCode.reAuthenticate,
+          properties: [
+            if (method != null) AuthenticationMethod(method),
+            AuthenticationData(response.data),
+          ],
+        ),
+      );
     }
   }
 

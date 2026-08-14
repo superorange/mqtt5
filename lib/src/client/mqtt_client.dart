@@ -31,6 +31,7 @@ import '../transport/tcp_transport.dart';
 import '../transport/tls_transport.dart';
 import 'connection_manager.dart';
 import 'flow_controller.dart';
+import 'mqtt_authenticator.dart';
 import 'mqtt_connection_state.dart';
 import 'mqtt_message.dart';
 import 'mqtt_publish_result.dart';
@@ -53,6 +54,7 @@ final class MqttClient {
     this.password,
     this.logger = const SilentLogger(),
     this.reconnectManager,
+    this.authenticator,
     this.transportFactory,
   }) : clientId = clientId ?? _generateClientId() {
     _connectionManager = ConnectionManager(
@@ -78,6 +80,7 @@ final class MqttClient {
   final bool Function(X509Certificate)? onBadCertificate;
   final List<String>? alpnProtocols;
   final ReconnectManager? reconnectManager;
+  final MqttAuthenticator? authenticator;
 
   /// Overrides transport creation; intended for tests and custom transports.
   final MqttTransport Function()? transportFactory;
@@ -106,6 +109,8 @@ final class MqttClient {
   Duration _keepAlive = const Duration(seconds: 60);
   Duration? _sessionExpiryInterval;
   List<MqttProperty> _connectProperties = const [];
+  String? _authenticationMethod;
+  Uint8List? _authenticationData;
 
   MqttConnectionState get state => _connectionManager.state;
 
@@ -113,6 +118,10 @@ final class MqttClient {
 
   /// Whether the broker resumed a previous session on the last CONNACK.
   bool get sessionPresent => _sessionPresent;
+
+  /// Invoked when the broker reports it has moved to another server.
+  void Function(String? serverReference, MqttReasonCode reasonCode)?
+      onServerMoved;
 
   /// Incoming application messages.
   Stream<MqttMessage> get messages => _messages.stream;
@@ -127,6 +136,8 @@ final class MqttClient {
     int receiveMaximum = 65535,
     int maximumPacketSize = 268435455,
     int topicAliasMaximum = 0,
+    String? authenticationMethod,
+    Uint8List? authenticationData,
   }) async {
     _cleanStart = cleanStart;
     _keepAlive = keepAlive;
@@ -135,8 +146,11 @@ final class MqttClient {
     _clientReceiveMaximum = receiveMaximum;
     _clientMaximumPacketSize = maximumPacketSize;
     _clientTopicAliasMaximum = topicAliasMaximum;
+    _authenticationMethod = authenticationMethod;
+    _authenticationData = authenticationData;
     _connectionManager.connackTimeout = connackTimeout;
     _connectionManager.clientMaximumPacketSize = maximumPacketSize;
+    _connectionManager.authenticator = authenticator;
 
     if (cleanStart) {
       _discardSession(notify: false, clearSubscriptions: true);
@@ -155,11 +169,11 @@ final class MqttClient {
       _connectionManager.send(
         MqttDisconnectPacket(reasonCode: reasonCode, properties: properties),
       );
-      await _connectionManager.flush();
     } on MqttException catch (e) {
       logger.log(MqttLogLevel.debug, 'DISCONNECT send failed: $e');
     }
     _flow.reset();
+    // stop() closes the transport, which flushes the queued DISCONNECT.
     await _connectionManager.stop();
   }
 
@@ -442,9 +456,21 @@ final class MqttClient {
       case MqttPubcompPacket pubcomp:
         _handlePubcomp(pubcomp);
       case MqttDisconnectPacket disconnect:
+        final reasonCode = disconnect.reasonCode;
+        if (reasonCode != null &&
+            (reasonCode == MqttReasonCode.useAnotherServer ||
+                reasonCode == MqttReasonCode.serverMoved)) {
+          String? serverReference;
+          for (final property in disconnect.properties) {
+            if (property is ServerReference) {
+              serverReference = property.value;
+            }
+          }
+          onServerMoved?.call(serverReference, reasonCode);
+        }
         logger.log(
           MqttLogLevel.warning,
-          'Broker sent DISCONNECT: ${disconnect.reasonCode}',
+          'Broker sent DISCONNECT: $reasonCode',
         );
       default:
         break;
@@ -800,6 +826,10 @@ final class MqttClient {
           MaximumPacketSize(_clientMaximumPacketSize),
         if (_clientTopicAliasMaximum != 0)
           TopicAliasMaximum(_clientTopicAliasMaximum),
+        if (_authenticationMethod != null)
+          AuthenticationMethod(_authenticationMethod!),
+        if (_authenticationData != null)
+          AuthenticationData(_authenticationData!),
         ..._connectProperties,
       ],
       will: will,

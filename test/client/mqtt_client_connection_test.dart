@@ -162,7 +162,7 @@ Future<void> _rejectingBroker(
             MqttPacketCodec.encode(
               const MqttConnackPacket(
                 sessionPresent: false,
-                reasonCode: MqttReasonCode.notAuthorized,
+                reasonCode: MqttReasonCode.serverUnavailable,
               ),
             ),
           );

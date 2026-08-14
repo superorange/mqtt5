@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:mqtt5/src/client/mqtt_client.dart';
 import 'package:mqtt5/src/client/reconnect_manager.dart';
 import 'package:mqtt5/src/mqtt_qos.dart';
+import 'package:mqtt5/src/packet/connect.dart';
+import 'package:mqtt5/src/packet/mqtt_packet_codec.dart';
 import 'package:mqtt5/src/subscription.dart';
 import 'package:test/test.dart';
 
@@ -163,6 +165,48 @@ void main() {
         expect(utf8.decode(message.payload), 'while-offline');
 
         await client.disconnect();
+      } finally {
+        broker.kill();
+      }
+    });
+
+    test('last will is published on abnormal disconnect', () async {
+      final port = await _freePort();
+      final broker = await _startBroker(port);
+
+      try {
+        final subscriber = MqttClient(
+          host: '127.0.0.1',
+          port: port,
+          clientId: 'will-subscriber',
+        );
+        await subscriber.connect();
+        final messageFuture = subscriber.messages.first;
+        await subscriber.subscribe(
+          'will/topic',
+          options: const MqttSubscriptionOptions(qos: MqttQos.atLeastOnce),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+
+        // Connect a raw socket with a Last Will and kill it abruptly.
+        final socket = await Socket.connect('127.0.0.1', port);
+        final connect = MqttConnectPacket(
+          clientId: 'will-client',
+          will: MqttWill(
+            topic: 'will/topic',
+            payload: utf8.encode('client-died'),
+            qos: MqttQos.atLeastOnce,
+          ),
+        );
+        socket.add(MqttPacketCodec.encode(connect));
+        await socket.first.timeout(const Duration(seconds: 5));
+        socket.destroy();
+
+        final message =
+            await messageFuture.timeout(const Duration(seconds: 5));
+        expect(utf8.decode(message.payload), 'client-died');
+
+        await subscriber.disconnect();
       } finally {
         broker.kill();
       }
