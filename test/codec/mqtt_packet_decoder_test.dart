@@ -147,6 +147,26 @@ void main() {
     });
   });
 
+  group('payload isolation', () {
+    test('decoded payloads do not alias the shared buffer', () {
+      final decoder = MqttPacketDecoder();
+      final p1 = MqttPacketCodec.encode(MqttPublishPacket(
+        topicName: 'a',
+        payload: Uint8List.fromList([0x11, 0x11]),
+      ));
+      final p2 = MqttPacketCodec.encode(MqttPublishPacket(
+        topicName: 'b',
+        payload: Uint8List.fromList([0x22, 0x22]),
+      ));
+      final first = decoder.feed(p1);
+      final second = decoder.feed(p2);
+      expect(first, hasLength(1));
+      expect(second, hasLength(1));
+      expect((first[0] as MqttPublishPacket).payload, [0x11, 0x11]);
+      expect((second[0] as MqttPublishPacket).payload, [0x22, 0x22]);
+    });
+  });
+
   group('guards', () {
     test('declared size exceeding maximum throws too large', () {
       final decoder = MqttPacketDecoder(maximumPacketSize: 100);

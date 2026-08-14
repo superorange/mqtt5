@@ -1,7 +1,16 @@
 /// A pure-Dart MQTT 5.0 client library.
 library;
 
+export 'src/client/connection_manager.dart';
+export 'src/client/keep_alive_manager.dart';
+export 'src/client/mqtt_client.dart';
+export 'src/client/mqtt_connection_state.dart';
+export 'src/client/mqtt_message.dart';
+export 'src/client/mqtt_publish_result.dart';
+export 'src/client/reconnect_manager.dart';
+export 'src/codec/mqtt_packet_decoder.dart';
 export 'src/exception/mqtt_exception.dart';
+export 'src/logging/mqtt_logger.dart';
 export 'src/mqtt_qos.dart';
 export 'src/packet/auth.dart';
 export 'src/packet/connack.dart';

@@ -33,9 +33,14 @@ final class ByteAccumulator {
 
   int peekByte(int index) => _data[_start + index];
 
-  /// Removes and returns the first [count] bytes as a view.
+  /// Removes and returns the first [count] bytes.
+  ///
+  /// The result is a copy: the accumulator reuses its internal buffer, so a
+  /// view would be corrupted by later appends and compactions.
   Uint8List take(int count) {
-    final result = Uint8List.sublistView(_data, _start, _start + count);
+    final result = Uint8List.fromList(
+      Uint8List.sublistView(_data, _start, _start + count),
+    );
     _start += count;
     return result;
   }

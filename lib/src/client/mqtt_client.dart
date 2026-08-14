@@ -13,12 +13,17 @@ import '../packet/mqtt_packet.dart';
 import '../packet/puback.dart';
 import '../packet/pubcomp.dart';
 import '../packet/publish.dart';
+import '../packet/pubrec.dart';
+import '../packet/pubrel.dart';
 import '../packet/mqtt_reason_code.dart';
 import '../packet/suback.dart';
 import '../packet/subscribe.dart';
 import '../packet/unsuback.dart';
 import '../packet/unsubscribe.dart';
 import '../property/mqtt_property.dart';
+import '../session/incoming_qos2.dart';
+import '../session/outgoing_qos1.dart';
+import '../session/outgoing_qos2.dart';
 import '../session/packet_identifier_pool.dart';
 import '../subscription.dart';
 import '../transport/mqtt_transport.dart';
@@ -82,7 +87,9 @@ final class MqttClient {
   final PacketIdentifierPool _packetIds = PacketIdentifierPool();
   final Map<int, Completer<MqttSubackPacket>> _pendingSubscribes = {};
   final Map<int, Completer<MqttUnsubackPacket>> _pendingUnsubscribes = {};
-  final Map<int, Completer<MqttPublishResult>> _pendingPublishes = {};
+  final OutgoingQos1Store _outgoingQos1 = OutgoingQos1Store();
+  final OutgoingQos2Store _outgoingQos2 = OutgoingQos2Store();
+  final IncomingQos2Store _incomingQos2 = IncomingQos2Store();
 
   bool _connected = false;
 
@@ -223,19 +230,89 @@ final class MqttClient {
     bool retain = false,
     List<MqttProperty> properties = const [],
   }) async {
-    if (qos == MqttQos.atMostOnce) {
+    switch (qos) {
+      case MqttQos.atMostOnce:
+        _connectionManager.send(
+          MqttPublishPacket(
+            topicName: topic,
+            payload: payload,
+            qos: qos,
+            retain: retain,
+            properties: properties,
+          ),
+        );
+        return const MqttPublishResult();
+      case MqttQos.atLeastOnce:
+        return _publishQos1(topic, payload, retain: retain, properties: properties);
+      case MqttQos.exactlyOnce:
+        return _publishQos2(topic, payload, retain: retain, properties: properties);
+    }
+  }
+
+  Future<MqttPublishResult> _publishQos1(
+    String topic,
+    Uint8List payload, {
+    required bool retain,
+    required List<MqttProperty> properties,
+  }) async {
+    final packetIdentifier = await _packetIds.allocate();
+    final entry = OutgoingQos1Entry(
+      packetIdentifier: packetIdentifier,
+      topic: topic,
+      payload: payload,
+      retain: retain,
+      properties: properties,
+    );
+    _outgoingQos1.put(entry);
+    try {
       _connectionManager.send(
         MqttPublishPacket(
           topicName: topic,
           payload: payload,
-          qos: qos,
+          qos: MqttQos.atLeastOnce,
           retain: retain,
+          packetIdentifier: packetIdentifier,
           properties: properties,
         ),
       );
-      return const MqttPublishResult();
+      return await entry.completer.future;
+    } finally {
+      _outgoingQos1.remove(packetIdentifier);
+      _packetIds.release(packetIdentifier);
     }
-    throw UnimplementedError('QoS ${qos.value} publish is not implemented yet');
+  }
+
+  Future<MqttPublishResult> _publishQos2(
+    String topic,
+    Uint8List payload, {
+    required bool retain,
+    required List<MqttProperty> properties,
+  }) async {
+    final packetIdentifier = await _packetIds.allocate();
+    final entry = OutgoingQos2Entry(
+      packetIdentifier: packetIdentifier,
+      topic: topic,
+      payload: payload,
+      retain: retain,
+      properties: properties,
+    );
+    _outgoingQos2.put(entry);
+    try {
+      _connectionManager.send(
+        MqttPublishPacket(
+          topicName: topic,
+          payload: payload,
+          qos: MqttQos.exactlyOnce,
+          retain: retain,
+          packetIdentifier: packetIdentifier,
+          properties: properties,
+        ),
+      );
+      return await entry.completer.future;
+    } finally {
+      _outgoingQos2.remove(packetIdentifier);
+      _packetIds.release(packetIdentifier);
+    }
   }
 
   void _throwIfSubackRejected(MqttSubackPacket suback) {
@@ -258,23 +335,13 @@ final class MqttClient {
       case MqttUnsubackPacket unsuback:
         _completePending(_pendingUnsubscribes, unsuback.packetIdentifier, unsuback);
       case MqttPubackPacket puback:
-        _completePending(
-          _pendingPublishes,
-          puback.packetIdentifier,
-          MqttPublishResult(
-            reasonCode: puback.reasonCode ?? MqttReasonCode.success,
-            properties: puback.properties,
-          ),
-        );
+        _handlePuback(puback);
+      case MqttPubrecPacket pubrec:
+        _handlePubrec(pubrec);
+      case MqttPubrelPacket pubrel:
+        _handlePubrel(pubrel);
       case MqttPubcompPacket pubcomp:
-        _completePending(
-          _pendingPublishes,
-          pubcomp.packetIdentifier,
-          MqttPublishResult(
-            reasonCode: pubcomp.reasonCode ?? MqttReasonCode.success,
-            properties: pubcomp.properties,
-          ),
-        );
+        _handlePubcomp(pubcomp);
       case MqttDisconnectPacket disconnect:
         logger.log(
           MqttLogLevel.warning,
@@ -297,6 +364,90 @@ final class MqttClient {
   }
 
   void _handlePublish(MqttPublishPacket publish) {
+    switch (publish.qos) {
+      case MqttQos.atMostOnce:
+        _deliver(publish);
+      case MqttQos.atLeastOnce:
+        _deliver(publish);
+        _connectionManager.send(
+          MqttPubackPacket(packetIdentifier: publish.packetIdentifier),
+        );
+      case MqttQos.exactlyOnce:
+        _handleIncomingQos2(publish);
+    }
+  }
+
+  void _handleIncomingQos2(MqttPublishPacket publish) {
+    final isNew = _incomingQos2.add(publish.packetIdentifier);
+    if (isNew) {
+      _deliver(publish);
+    }
+    _connectionManager.send(
+      MqttPubrecPacket(packetIdentifier: publish.packetIdentifier),
+    );
+  }
+
+  void _handlePuback(MqttPubackPacket puback) {
+    final entry = _outgoingQos1.remove(puback.packetIdentifier);
+    if (entry == null) {
+      return;
+    }
+    _packetIds.release(puback.packetIdentifier);
+    entry.completer.complete(
+      MqttPublishResult(
+        reasonCode: puback.reasonCode ?? MqttReasonCode.success,
+        properties: puback.properties,
+      ),
+    );
+  }
+
+  void _handlePubrec(MqttPubrecPacket pubrec) {
+    final entry = _outgoingQos2[pubrec.packetIdentifier];
+    if (entry == null) {
+      return;
+    }
+    final reasonCode = pubrec.reasonCode;
+    if (reasonCode != null && reasonCode.value >= 0x80) {
+      _outgoingQos2.remove(pubrec.packetIdentifier);
+      _packetIds.release(pubrec.packetIdentifier);
+      entry.completer.complete(
+        MqttPublishResult(reasonCode: reasonCode, properties: pubrec.properties),
+      );
+      return;
+    }
+    entry.state = OutgoingQos2State.pubRecReceived;
+    _connectionManager.send(
+      MqttPubrelPacket(packetIdentifier: pubrec.packetIdentifier),
+    );
+  }
+
+  void _handlePubrel(MqttPubrelPacket pubrel) {
+    final known = _incomingQos2.contains(pubrel.packetIdentifier);
+    _incomingQos2.remove(pubrel.packetIdentifier);
+    _connectionManager.send(
+      MqttPubcompPacket(
+        packetIdentifier: pubrel.packetIdentifier,
+        reasonCode:
+            known ? null : MqttReasonCode.packetIdentifierNotFound,
+      ),
+    );
+  }
+
+  void _handlePubcomp(MqttPubcompPacket pubcomp) {
+    final entry = _outgoingQos2.remove(pubcomp.packetIdentifier);
+    if (entry == null) {
+      return;
+    }
+    _packetIds.release(pubcomp.packetIdentifier);
+    entry.completer.complete(
+      MqttPublishResult(
+        reasonCode: pubcomp.reasonCode ?? MqttReasonCode.success,
+        properties: pubcomp.properties,
+      ),
+    );
+  }
+
+  void _deliver(MqttPublishPacket publish) {
     _messages.add(
       MqttMessage(
         topic: publish.topicName,
@@ -325,8 +476,24 @@ final class MqttClient {
     }
     _failPending(_pendingSubscribes);
     _failPending(_pendingUnsubscribes);
-    _failPending(_pendingPublishes);
+    _failInflightPublishes();
     _packetIds.reset();
+  }
+
+  void _failInflightPublishes() {
+    for (final entry in _outgoingQos1.entries.toList()) {
+      if (!entry.completer.isCompleted) {
+        entry.completer.completeError(MqttConnectionException('Connection lost'));
+      }
+    }
+    _outgoingQos1.clear();
+    for (final entry in _outgoingQos2.entries.toList()) {
+      if (!entry.completer.isCompleted) {
+        entry.completer.completeError(MqttConnectionException('Connection lost'));
+      }
+    }
+    _outgoingQos2.clear();
+    _incomingQos2.clear();
   }
 
   void _failPending<T>(Map<int, Completer<T>> pending) {

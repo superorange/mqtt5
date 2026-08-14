@@ -59,6 +59,57 @@ void main() {
       }
     });
 
+    test('QoS1 and QoS2 publish round trip through the broker', () async {
+      final port = await _freePort();
+      final broker = await _startBroker(port);
+
+      try {
+        final client = MqttClient(
+          host: '127.0.0.1',
+          port: port,
+          clientId: 'qos-test',
+        );
+
+        await client.connect(keepAlive: const Duration(seconds: 5));
+
+        final messages = <dynamic>[];
+        final sub = client.messages.listen(messages.add);
+        await client.subscribe(
+          'qos/topic',
+          options: const MqttSubscriptionOptions(qos: MqttQos.exactlyOnce),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+
+        // QoS 1 publish completes with success.
+        final qos1 = await client.publish(
+          'qos/topic',
+          utf8.encode('one'),
+          qos: MqttQos.atLeastOnce,
+        );
+        expect(qos1.reasonCode.value, 0x00);
+
+        // QoS 2 publish completes with success.
+        final qos2 = await client.publish(
+          'qos/topic',
+          utf8.encode('two'),
+          qos: MqttQos.exactlyOnce,
+        );
+        expect(qos2.reasonCode.value, 0x00);
+
+        await _waitFor(
+          () => messages.length >= 2,
+          timeout: const Duration(seconds: 5),
+        );
+        final payloads = messages.map((m) => utf8.decode(m.payload)).toList();
+        expect(payloads, containsAll(['one', 'two']));
+
+        await sub.cancel();
+        await client.disconnect();
+      } finally {
+        broker.kill();
+      }
+    });
+
     test('reconnect after broker restart', () async {
       final port = await _freePort();
       var broker = await _startBroker(port);
