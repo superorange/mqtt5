@@ -57,8 +57,12 @@ await client.publish(
   ],
 );
 
-await client.disconnect();
+await client.close();
 ```
+
+`disconnect()` closes the connection and can be followed by another
+`connect()`. `close()` also releases the `messages`, `stateStream` and
+`errors` streams, after which the client cannot be reused.
 
 ## MQTT 5 feature matrix
 
@@ -118,6 +122,42 @@ The client restores in-flight QoS 1/2 state and does not re-subscribe. If the
 session was lost, in-flight publishes fail and known subscriptions are
 re-established automatically.
 
+### Reconnect and error handling
+
+A dropped connection is re-established with exponential backoff and jitter.
+Pass `autoReconnect: false` to disable that: `connect()` then fails on the
+first unsuccessful attempt, and a connection that drops later moves the client
+to `disconnected` without a retry.
+
+```dart
+final client = MqttClient(
+  host: 'broker.example.com',
+  autoReconnect: false,
+  reconnectManager: ReconnectManager(maxDelay: Duration(minutes: 1)),
+);
+```
+
+The first `connect()` throws if the broker rejects it. Once the client is
+running there is no caller left to throw to, so a rejection or an
+unrecoverable failure on a later reconnect is reported on `client.errors`:
+
+```dart
+client.errors.listen((error) {
+  // Credentials revoked, broker moved, protocol error: the client has stopped.
+});
+```
+
+Reason codes the client cannot recover from — Server Moved, Use Another
+Server, Banned, Not Authorized, Bad Authentication Method — stop the client
+rather than retrying against a server that will keep refusing it.
+
+### Timeouts
+
+`publish` (QoS 1/2), `subscribe` and `unsubscribe` wait up to
+`operationTimeout` (30 seconds by default) for the broker's acknowledgement
+and then fail with `MqttTimeoutException`. Pass `Duration.zero` to wait
+indefinitely.
+
 ## TLS
 
 ```dart
@@ -160,9 +200,12 @@ Implement `MqttAuthenticator` to respond to each challenge.
 ## Limitations
 
 - WebSocket transport is not implemented yet.
-- The client does not automatically follow `Server Reference` redirects; it
-  surfaces them via `MqttServerMovedException` (on connect) and the
-  `onServerMoved` callback (on DISCONNECT).
+- The client does not automatically follow `Server Reference` redirects. It
+  stops reconnecting and surfaces the redirect via `MqttServerMovedException`
+  (thrown from `connect`, or reported on `errors`) and the `onServerMoved`
+  callback; pointing a new client at the new address is up to you.
+- Session state is in memory only: it survives a reconnect, not a process
+  restart.
 - TLS session resumption (RFC 5077) is left to the platform TLS stack.
 
 ## Development
