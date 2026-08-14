@@ -24,3 +24,7 @@ export 'src/packet/unsubscribe.dart';
 export 'src/property/mqtt_property.dart';
 export 'src/property/property_identifier.dart';
 export 'src/subscription.dart';
+export 'src/transport/memory_transport.dart';
+export 'src/transport/mqtt_transport.dart';
+export 'src/transport/tcp_transport.dart';
+export 'src/transport/tls_transport.dart';
