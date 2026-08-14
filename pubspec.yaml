@@ -4,11 +4,7 @@ version: 0.1.0
 repository: https://github.com/superorange/mqtt5
 
 environment:
-  sdk: ^3.12.2
-
-# Add regular dependencies here.
-dependencies:
-  path: ^1.9.1
+  sdk: ^3.0.0
 
 dev_dependencies:
   lints: ^6.1.0
