@@ -59,12 +59,14 @@ final class MqttPacketDecoder {
       final b = _accumulator.peekByte(1 + i);
       value += (b & 0x7F) * multiplier;
       if ((b & 0x80) == 0) {
-        if (value > maximumPacketSize) {
+        // Maximum Packet Size covers the whole packet, fixed header included
+        // (specification section 3.1.2.11.4).
+        final total = 1 + i + 1 + value;
+        if (total > maximumPacketSize) {
           throw MqttPacketTooLargeException(
-            'Packet size $value exceeds maximum $maximumPacketSize',
+            'Packet size $total exceeds maximum $maximumPacketSize',
           );
         }
-        final total = 1 + i + 1 + value;
         if (_accumulator.available < total) {
           return null;
         }

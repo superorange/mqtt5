@@ -39,6 +39,8 @@ final class ConnectionManager {
     required this.onPacket,
     required this.onConnected,
     required this.onConnectionLost,
+    this.onFatalError,
+    this.autoReconnect = true,
     this.connackTimeout = const Duration(seconds: 10),
     this.logger = const SilentLogger(),
     ReconnectManager? reconnectManager,
@@ -46,6 +48,13 @@ final class ConnectionManager {
 
   final MqttTransport Function() transportFactory;
   final void Function(MqttPacket packet) onPacket;
+
+  /// Called when the connection ends for a reason no retry can fix, and no
+  /// caller is awaiting [start] to receive the error.
+  final void Function(Object error, StackTrace stackTrace)? onFatalError;
+
+  /// Whether a lost connection is re-established automatically.
+  final bool autoReconnect;
 
   /// Called when the handshake completes and [MqttConnackPacket] was received
   /// with a success reason code.
@@ -73,17 +82,24 @@ final class ConnectionManager {
   MqttTransport? _transport;
   MqttPacketDecoder _decoder = MqttPacketDecoder();
   StreamSubscription? _incomingSub;
-  late KeepAliveManager _keepAlive;
+
+  // Created lazily but unconditionally, so tearing down a connection that was
+  // never started is safe.
+  late final KeepAliveManager _keepAlive = KeepAliveManager(
+    onPingRequired: _onPingRequired,
+    onPingTimeout: _onPingTimeout,
+  );
 
   final StreamController<MqttConnectionState> _stateController =
       StreamController<MqttConnectionState>.broadcast(sync: true);
   MqttConnectionState _state = MqttConnectionState.disconnected;
 
-  MqttConnectPacket? _connectPacket;
+  MqttConnectPacket Function()? _connectPacketBuilder;
   Completer<MqttConnackPacket>? _connackCompleter;
   Timer? _connackTimer;
   bool _running = false;
   bool _runActive = false;
+  bool _disposed = false;
 
   MqttConnectionState get state => _state;
 
@@ -91,19 +107,26 @@ final class ConnectionManager {
 
   KeepAliveManager get keepAlive => _keepAlive;
 
-  /// Starts the connect/reconnect loop using [connectPacket] for every
-  /// (re)connection attempt.
-  Future<void> start(MqttConnectPacket connectPacket) async {
-    _connectPacket = connectPacket;
+  /// Starts the connect/reconnect loop, calling [connectPacketBuilder] for
+  /// every (re)connection attempt.
+  Future<void> start(MqttConnectPacket Function() connectPacketBuilder) async {
+    if (_disposed) {
+      throw MqttConnectionException('Client has been closed');
+    }
+    _connectPacketBuilder = connectPacketBuilder;
     if (_running) {
       return;
     }
     _running = true;
-    _keepAlive = KeepAliveManager(
-      onPingRequired: _onPingRequired,
-      onPingTimeout: _onPingTimeout,
-    );
-    await _run();
+    await _run(initial: true);
+  }
+
+  /// Marks the start of a client-initiated disconnect, so observers see the
+  /// shutdown rather than an unexplained jump to [MqttConnectionState.disconnected].
+  void beginDisconnect() {
+    if (_running) {
+      _setState(MqttConnectionState.disconnecting);
+    }
   }
 
   /// Stops the loop and closes the transport. No reconnect is attempted.
@@ -119,6 +142,13 @@ final class ConnectionManager {
     _keepAlive.stop();
     await _teardownTransport();
     _setState(MqttConnectionState.disconnected);
+  }
+
+  /// Releases resources held by the manager. The manager cannot be restarted.
+  Future<void> dispose() async {
+    await stop();
+    _disposed = true;
+    await _stateController.close();
   }
 
   /// Sends a packet to the broker.
@@ -153,7 +183,13 @@ final class ConnectionManager {
     _keepAlive.onOutboundActivity();
   }
 
-  Future<void> _run() async {
+  /// Runs the connect/reconnect loop.
+  ///
+  /// [initial] marks the run started by [start], whose caller is awaiting the
+  /// result: errors that end the loop are rethrown to them. Runs started from
+  /// a connection-lost callback have no such caller, so their errors go to
+  /// [onFatalError] instead of escaping as unhandled asynchronous errors.
+  Future<void> _run({bool initial = false}) async {
     if (_runActive) {
       return;
     }
@@ -168,15 +204,14 @@ final class ConnectionManager {
           _reconnect.reset();
           _setState(MqttConnectionState.connected);
           onConnected(_lastConnack!);
-          _runActive = false;
           return;
-        } on Object catch (e) {
+        } on Object catch (e, s) {
           if (!_running) {
             break;
           }
-          if (_isFatal(e)) {
-            _setState(MqttConnectionState.disconnected);
-            rethrow;
+          if (_isFatal(e) || !autoReconnect) {
+            await _abort(e, s, rethrowToCaller: initial);
+            return;
           }
           await _teardownTransport();
           _setState(MqttConnectionState.reconnecting);
@@ -192,6 +227,27 @@ final class ConnectionManager {
       }
     } finally {
       _runActive = false;
+    }
+  }
+
+  /// Ends the loop for good: stops retrying, releases the transport and
+  /// reports [error] exactly once.
+  Future<void> _abort(
+    Object error,
+    StackTrace stackTrace, {
+    required bool rethrowToCaller,
+  }) async {
+    _running = false;
+    _keepAlive.stop();
+    await _teardownTransport();
+    _setState(MqttConnectionState.disconnected);
+    if (rethrowToCaller) {
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+    logger.log(MqttLogLevel.error, 'Connection ended: $error');
+    final handler = onFatalError;
+    if (handler != null) {
+      handler(error, stackTrace);
     }
   }
 
@@ -218,10 +274,11 @@ final class ConnectionManager {
       onError: (Object error) => _onTransportError(error),
     );
 
-    final connectPacket = _connectPacket;
-    if (connectPacket == null) {
+    final builder = _connectPacketBuilder;
+    if (builder == null) {
       throw MqttConnectionException('No CONNECT packet configured');
     }
+    final connectPacket = builder();
 
     _connackCompleter = Completer<MqttConnackPacket>();
     _connackTimer = Timer(connackTimeout, _onConnackTimeout);
@@ -232,6 +289,7 @@ final class ConnectionManager {
     _lastConnack = connack;
 
     while (connack.reasonCode == MqttReasonCode.continueAuthentication) {
+      _setState(MqttConnectionState.authenticating);
       await _continueAuthentication(connack, connectPacket);
       _connackCompleter = Completer<MqttConnackPacket>();
       _connackTimer = Timer(connackTimeout, _onConnackTimeout);
@@ -348,19 +406,61 @@ final class ConnectionManager {
           continue;
         }
         if (packet is MqttAuthPacket) {
-          unawaited(_handleReAuth(packet));
+          unawaited(_handleReAuth(packet).catchError((Object e) {
+            logger.log(MqttLogLevel.error, 'Re-authentication failed: $e');
+          }));
           continue;
         }
         onPacket(packet);
       }
-    } on MqttException catch (e) {
+    } on Object catch (e) {
+      // Anything thrown while decoding or dispatching a packet is a fault of
+      // the peer's byte stream, including errors the codec did not classify.
+      // Letting it escape would take down the enclosing zone.
       metrics.protocolErrorCount++;
       logger.log(MqttLogLevel.error, 'Protocol error, closing connection: $e');
-      _teardownTransport();
-      _keepAlive.stop();
-      onConnectionLost();
-      unawaited(_run());
+      unawaited(_handleConnectionLoss(disconnectReason: _disconnectReasonFor(e)));
     }
+  }
+
+  MqttReasonCode _disconnectReasonFor(Object error) {
+    if (error is MqttMalformedPacketException) {
+      return MqttReasonCode.malformedPacket;
+    }
+    if (error is MqttPacketTooLargeException) {
+      return MqttReasonCode.packetTooLarge;
+    }
+    return MqttReasonCode.protocolError;
+  }
+
+  /// Tears the connection down and, if enabled, restarts the connect loop.
+  ///
+  /// The teardown is awaited before reconnecting so a new transport cannot be
+  /// installed while the old one is still being released.
+  Future<void> _handleConnectionLoss({MqttReasonCode? disconnectReason}) async {
+    if (!_running) {
+      return;
+    }
+    if (disconnectReason != null) {
+      // Best effort: tell the broker why we are going away (section 4.13).
+      try {
+        _write(MqttDisconnectPacket(reasonCode: disconnectReason));
+      } on Object {
+        // The connection is already gone; nothing to report.
+      }
+    }
+    _keepAlive.stop();
+    await _teardownTransport();
+    onConnectionLost();
+    if (!_running) {
+      return;
+    }
+    if (!autoReconnect) {
+      _running = false;
+      _setState(MqttConnectionState.disconnected);
+      return;
+    }
+    await _run();
   }
 
   Future<void> _handleReAuth(MqttAuthPacket auth) async {
@@ -420,11 +520,51 @@ final class ConnectionManager {
     if (!_running) {
       return;
     }
-    _teardownTransport();
-    _keepAlive.stop();
-    onConnectionLost();
-    unawaited(_run());
+    logger.log(MqttLogLevel.warning, 'Transport error: $error');
+    unawaited(_handleConnectionLoss());
   }
+
+  /// Handles a DISCONNECT sent by the broker (specification section 3.14).
+  ///
+  /// The broker will not accept any further packets on this connection, so
+  /// the transport is released immediately instead of waiting for the peer to
+  /// close the socket.
+  Future<void> handleServerDisconnect(MqttReasonCode? reasonCode) async {
+    if (!_running) {
+      return;
+    }
+    if (reasonCode != null && _isFatalDisconnectReason(reasonCode)) {
+      await _abort(
+        reasonCode == MqttReasonCode.useAnotherServer ||
+                reasonCode == MqttReasonCode.serverMoved
+            ? MqttServerMovedException(reasonCode.value, _lastServerReference)
+            : MqttServerRejectedException(
+                reasonCode.value,
+                'Broker closed the connection: ${reasonCode.name}',
+              ),
+        StackTrace.current,
+        rethrowToCaller: false,
+      );
+      onConnectionLost();
+      return;
+    }
+    await _handleConnectionLoss();
+  }
+
+  /// Reason codes after which reconnecting to the same server is pointless.
+  static bool _isFatalDisconnectReason(MqttReasonCode reasonCode) {
+    return reasonCode == MqttReasonCode.useAnotherServer ||
+        reasonCode == MqttReasonCode.serverMoved ||
+        reasonCode == MqttReasonCode.notAuthorized ||
+        reasonCode == MqttReasonCode.banned ||
+        reasonCode == MqttReasonCode.badAuthenticationMethod;
+  }
+
+  String? _lastServerReference;
+
+  /// Records the Server Reference from the broker's DISCONNECT, so an abort
+  /// triggered by it can carry the redirect target.
+  set serverReference(String? value) => _lastServerReference = value;
 
   void _onPingRequired() {
     try {
@@ -440,10 +580,7 @@ final class ConnectionManager {
     if (!_running) {
       return;
     }
-    _teardownTransport();
-    _keepAlive.stop();
-    onConnectionLost();
-    unawaited(_run());
+    unawaited(_handleConnectionLoss());
   }
 
   Future<void> _teardownTransport() async {
@@ -461,6 +598,8 @@ final class ConnectionManager {
       return;
     }
     _state = state;
-    _stateController.add(state);
+    if (!_stateController.isClosed) {
+      _stateController.add(state);
+    }
   }
 }

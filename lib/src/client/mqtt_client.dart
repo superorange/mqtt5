@@ -57,12 +57,16 @@ final class MqttClient {
     this.reconnectManager,
     this.authenticator,
     this.transportFactory,
+    this.autoReconnect = true,
+    this.operationTimeout = const Duration(seconds: 30),
   }) : clientId = clientId ?? _generateClientId() {
     _connectionManager = ConnectionManager(
       transportFactory: _createTransport,
       onPacket: _onPacket,
       onConnected: _onConnected,
       onConnectionLost: _onConnectionLost,
+      onFatalError: _onFatalError,
+      autoReconnect: autoReconnect,
       logger: logger,
       reconnectManager: reconnectManager,
     );
@@ -83,12 +87,29 @@ final class MqttClient {
   final ReconnectManager? reconnectManager;
   final MqttAuthenticator? authenticator;
 
+  /// Whether a lost connection is re-established automatically.
+  ///
+  /// With `false`, [connect] fails on the first unsuccessful attempt and a
+  /// connection that drops later is reported through [state] and [errors]
+  /// without any retry.
+  final bool autoReconnect;
+
+  /// How long [publish], [subscribe] and [unsubscribe] wait for the broker's
+  /// acknowledgement before failing with [MqttTimeoutException].
+  ///
+  /// [Duration.zero] disables the timeout and waits indefinitely.
+  final Duration operationTimeout;
+
   /// Overrides transport creation; intended for tests and custom transports.
   final MqttTransport Function()? transportFactory;
 
   late final ConnectionManager _connectionManager;
+  // Deliberately not a sync controller: a subscriber that throws must not
+  // unwind into the socket event handler and be mistaken for a peer error.
   final StreamController<MqttMessage> _messages =
-      StreamController<MqttMessage>.broadcast(sync: true);
+      StreamController<MqttMessage>.broadcast();
+  final StreamController<Object> _errors =
+      StreamController<Object>.broadcast();
 
   final MqttSession _session = MqttSession();
   final Map<int, Completer<MqttSubackPacket>> _pendingSubscribes = {};
@@ -96,6 +117,8 @@ final class MqttClient {
 
   bool _connected = false;
   bool _sessionPresent = false;
+  bool _closed = false;
+  String? _assignedClientId;
 
   final ServerCapabilities _capabilities = ServerCapabilities();
   final FlowController _flow = FlowController();
@@ -133,6 +156,17 @@ final class MqttClient {
   /// Incoming application messages.
   Stream<MqttMessage> get messages => _messages.stream;
 
+  /// Errors that ended the connection for good.
+  ///
+  /// A failure on the initial [connect] is thrown from that call. Once the
+  /// client is running, there is no caller left to throw to, so a rejection
+  /// or an unrecoverable failure on a later reconnect is reported here.
+  Stream<Object> get errors => _errors.stream;
+
+  /// The client identifier in use, which is the one the broker assigned in
+  /// CONNACK when the client connected with an empty [clientId].
+  String get effectiveClientId => _assignedClientId ?? clientId;
+
   /// Establishes (and maintains) the MQTT connection.
   Future<void> connect({
     bool cleanStart = true,
@@ -146,6 +180,16 @@ final class MqttClient {
     String? authenticationMethod,
     Uint8List? authenticationData,
   }) async {
+    if (_closed) {
+      throw MqttConnectionException('Client has been closed');
+    }
+    if (keepAlive.inSeconds > 0xFFFF) {
+      throw ArgumentError.value(
+        keepAlive,
+        'keepAlive',
+        'Keep Alive must not exceed 65535 seconds (18h12m15s)',
+      );
+    }
     _cleanStart = cleanStart;
     _keepAlive = keepAlive;
     _sessionExpiryInterval = sessionExpiryInterval;
@@ -160,18 +204,25 @@ final class MqttClient {
     _connectionManager.authenticator = authenticator;
 
     if (cleanStart) {
+      _assignedClientId = null;
       _discardSession(notify: false, clearSubscriptions: true);
     }
 
-    await _connectionManager.start(_buildConnectPacket());
+    // Passing a builder rather than a packet so every reconnect picks up the
+    // broker-assigned client identifier and the current session settings.
+    await _connectionManager.start(_buildConnectPacket);
   }
 
   /// Sends a DISCONNECT packet and closes the connection.
+  ///
+  /// Operations still awaiting an acknowledgement are failed with
+  /// [MqttConnectionException]; nothing is left pending.
   Future<void> disconnect({
     MqttReasonCode reasonCode = MqttReasonCode.success,
     List<MqttProperty> properties = const [],
   }) async {
     _connected = false;
+    _connectionManager.beginDisconnect();
     try {
       _connectionManager.send(
         MqttDisconnectPacket(reasonCode: reasonCode, properties: properties),
@@ -182,6 +233,55 @@ final class MqttClient {
     _flow.reset();
     // stop() closes the transport, which flushes the queued DISCONNECT.
     await _connectionManager.stop();
+    _abortPending(
+      MqttConnectionException('Disconnected before acknowledgement'),
+    );
+  }
+
+  /// Disconnects and releases every resource held by the client.
+  ///
+  /// The client cannot be reconnected afterwards; [messages], [stateStream]
+  /// and [errors] are closed.
+  Future<void> close({
+    MqttReasonCode reasonCode = MqttReasonCode.success,
+  }) async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    await disconnect(reasonCode: reasonCode);
+    await _connectionManager.dispose();
+    await _messages.close();
+    await _errors.close();
+  }
+
+  /// Fails every operation waiting for a broker acknowledgement.
+  void _abortPending(Object error) {
+    _failPending(_pendingSubscribes);
+    _failPending(_pendingUnsubscribes);
+    for (final entry in _session.outgoingQos1.entries.toList()) {
+      if (!entry.completer.isCompleted) {
+        entry.completer.completeError(error);
+      }
+    }
+    for (final entry in _session.outgoingQos2.entries.toList()) {
+      if (!entry.completer.isCompleted) {
+        entry.completer.completeError(error);
+      }
+    }
+  }
+
+  void _onFatalError(Object error, StackTrace stackTrace) {
+    _connected = false;
+    _abortPending(error);
+    if (_errors.hasListener) {
+      _errors.add(error);
+    } else {
+      logger.log(
+        MqttLogLevel.error,
+        'Unhandled connection error (no errors listener): $error',
+      );
+    }
   }
 
   /// Subscribes to [topicFilter], completing when the broker acknowledges.
@@ -191,32 +291,18 @@ final class MqttClient {
     String topicFilter, {
     MqttSubscriptionOptions options = const MqttSubscriptionOptions(),
     int? subscriptionIdentifier,
-  }) async {
-    _validateSubscriptionTopic(topicFilter);
-    final packetIdentifier = await _session.packetIds.allocate();
-    final completer = Completer<MqttSubackPacket>();
-    _pendingSubscribes[packetIdentifier] = completer;
-    try {
-      _connectionManager.send(
-        MqttSubscribePacket(
-          packetIdentifier: packetIdentifier,
-          subscriptions: [MqttSubscription(topicFilter, options: options)],
-          properties: [
-            if (subscriptionIdentifier != null)
-              SubscriptionIdentifier(subscriptionIdentifier),
-          ],
-        ),
-      );
-      final suback = await completer.future;
-      _throwIfSubackRejected(suback);
-      _session.subscriptions.add(MqttSubscription(topicFilter, options: options));
-    } finally {
-      _pendingSubscribes.remove(packetIdentifier);
-      _session.packetIds.release(packetIdentifier);
-    }
+  }) {
+    return subscribeAll(
+      [MqttSubscription(topicFilter, options: options)],
+      subscriptionIdentifier: subscriptionIdentifier,
+    );
   }
 
   /// Subscribes to multiple topic filters in a single SUBSCRIBE packet.
+  ///
+  /// If the broker accepts some filters and rejects others, the accepted ones
+  /// are recorded (and will be re-established after a session loss) before
+  /// [MqttServerRejectedException] is thrown for the rejected ones.
   Future<void> subscribeAll(
     List<MqttSubscription> subscriptions, {
     int? subscriptionIdentifier,
@@ -241,15 +327,36 @@ final class MqttClient {
           ],
         ),
       );
-      final suback = await completer.future;
-      _throwIfSubackRejected(suback);
-      for (final subscription in subscriptions) {
-        _session.subscriptions.add(subscription);
+      final suback = await _awaitAck(completer.future, 'SUBACK');
+      if (suback.reasonCodes.length != subscriptions.length) {
+        throw MqttProtocolException(
+          'SUBACK carries ${suback.reasonCodes.length} reason code(s) for '
+          '${subscriptions.length} topic filter(s)',
+        );
       }
+      for (var i = 0; i < subscriptions.length; i++) {
+        if (suback.reasonCodes[i] < 0x80) {
+          _session.subscriptions.add(subscriptions[i]);
+        }
+      }
+      _throwIfSubackRejected(suback);
     } finally {
       _pendingSubscribes.remove(packetIdentifier);
       _session.packetIds.release(packetIdentifier);
     }
+  }
+
+  /// Waits for a broker acknowledgement, applying [operationTimeout].
+  Future<T> _awaitAck<T>(Future<T> future, String what) {
+    if (operationTimeout <= Duration.zero) {
+      return future;
+    }
+    return future.timeout(
+      operationTimeout,
+      onTimeout: () => throw MqttTimeoutException(
+        'Timed out after ${operationTimeout.inSeconds}s waiting for $what',
+      ),
+    );
   }
 
   void _validateSubscriptionTopic(String topicFilter) {
@@ -282,7 +389,18 @@ final class MqttClient {
           topicFilters: topicFilters,
         ),
       );
-      final unsuback = await completer.future;
+      final unsuback = await _awaitAck(completer.future, 'UNSUBACK');
+      if (unsuback.reasonCodes.length != topicFilters.length) {
+        throw MqttProtocolException(
+          'UNSUBACK carries ${unsuback.reasonCodes.length} reason code(s) for '
+          '${topicFilters.length} topic filter(s)',
+        );
+      }
+      for (var i = 0; i < topicFilters.length; i++) {
+        if (unsuback.reasonCodes[i] < 0x80) {
+          _session.subscriptions.remove(topicFilters[i]);
+        }
+      }
       for (final reasonCode in unsuback.reasonCodes) {
         if (reasonCode >= 0x80) {
           throw MqttServerRejectedException(
@@ -290,9 +408,6 @@ final class MqttClient {
             'Unsubscribe failed',
           );
         }
-      }
-      for (final topicFilter in topicFilters) {
-        _session.subscriptions.remove(topicFilter);
       }
     } finally {
       _pendingUnsubscribes.remove(packetIdentifier);
@@ -312,7 +427,7 @@ final class MqttClient {
     bool retain = false,
     List<MqttProperty> properties = const [],
   }) async {
-    metrics.messagesPublished++;
+    _validatePublishTopic(topic);
     if (qos.value > _capabilities.maximumQos) {
       throw MqttFlowControlException(
         'The server only supports maximum QoS ${_capabilities.maximumQos}',
@@ -323,6 +438,7 @@ final class MqttClient {
         'The server does not support retained messages',
       );
     }
+    metrics.messagesPublished++;
     switch (qos) {
       case MqttQos.atMostOnce:
         final aliased = _applyOutgoingAlias(topic, properties);
@@ -335,6 +451,7 @@ final class MqttClient {
             properties: aliased.properties,
           ),
         );
+        aliased.commit();
         return const MqttPublishResult();
       case MqttQos.atLeastOnce:
         return _publishQos1(topic, payload, retain: retain, properties: properties);
@@ -343,27 +460,54 @@ final class MqttClient {
     }
   }
 
+  /// Rejects topic names that the broker is required to reject, so the caller
+  /// gets a local error instead of being disconnected.
+  void _validatePublishTopic(String topic) {
+    if (topic.contains('+') || topic.contains('#')) {
+      throw ArgumentError.value(
+        topic,
+        'topic',
+        'A publish topic name must not contain wildcards',
+      );
+    }
+    if (topic.isEmpty) {
+      throw ArgumentError.value(topic, 'topic', 'Topic name must not be empty');
+    }
+  }
+
   /// Applies the client-to-server Topic Alias mapping to an outgoing publish.
   ///
-  /// Returns the possibly-aliased topic name and the properties to send. The
-  /// entry's stored topic/properties are always the original values so a
+  /// Returns the possibly-aliased topic name and the properties to send. A
+  /// newly reserved alias is only bound to the topic once [_Aliased.commit] is
+  /// called, which must happen after the PUBLISH carrying the full topic name
+  /// has been written: an alias the broker never received would make every
+  /// later publish reference an unknown alias.
+  ///
+  /// Stored session entries always keep the original topic/properties so a
   /// retransmit after reconnect uses the full topic name.
-  ({String topic, List<MqttProperty> properties}) _applyOutgoingAlias(
-    String topic,
-    List<MqttProperty> properties,
-  ) {
+  _Aliased _applyOutgoingAlias(String topic, List<MqttProperty> properties) {
     if (properties.any((p) => p is TopicAlias)) {
-      return (topic: topic, properties: properties);
+      return _Aliased(topic, properties, null, _outgoingAliases);
     }
     final existing = _outgoingAliases.aliasFor(topic);
     if (existing != null) {
-      return (topic: '', properties: [...properties, TopicAlias(existing)]);
+      return _Aliased(
+        '',
+        [...properties, TopicAlias(existing)],
+        null,
+        _outgoingAliases,
+      );
     }
-    final assigned = _outgoingAliases.assign(topic);
-    if (assigned != null) {
-      return (topic: topic, properties: [...properties, TopicAlias(assigned)]);
+    final reserved = _outgoingAliases.reserve();
+    if (reserved != null) {
+      return _Aliased(
+        topic,
+        [...properties, TopicAlias(reserved)],
+        (alias: reserved, topic: topic),
+        _outgoingAliases,
+      );
     }
-    return (topic: topic, properties: properties);
+    return _Aliased(topic, properties, null, _outgoingAliases);
   }
 
   Future<MqttPublishResult> _publishQos1(
@@ -394,11 +538,15 @@ final class MqttClient {
           properties: aliased.properties,
         ),
       );
-      return await entry.completer.future;
+      aliased.commit();
+      return await _awaitAck(entry.completer.future, 'PUBACK');
     } catch (_) {
       _flow.release();
       rethrow;
     } finally {
+      // Single owner of both resources: the acknowledgement handlers never
+      // release them, so an identifier cannot be handed out again while this
+      // call still refers to it.
       _session.outgoingQos1.remove(packetIdentifier);
       _session.packetIds.release(packetIdentifier);
     }
@@ -432,7 +580,8 @@ final class MqttClient {
           properties: aliased.properties,
         ),
       );
-      return await entry.completer.future;
+      aliased.commit();
+      return await _awaitAck(entry.completer.future, 'PUBCOMP');
     } catch (_) {
       _flow.release();
       rethrow;
@@ -470,25 +619,32 @@ final class MqttClient {
       case MqttPubcompPacket pubcomp:
         _handlePubcomp(pubcomp);
       case MqttDisconnectPacket disconnect:
-        final reasonCode = disconnect.reasonCode;
-        if (reasonCode != null &&
-            (reasonCode == MqttReasonCode.useAnotherServer ||
-                reasonCode == MqttReasonCode.serverMoved)) {
-          String? serverReference;
-          for (final property in disconnect.properties) {
-            if (property is ServerReference) {
-              serverReference = property.value;
-            }
-          }
-          onServerMoved?.call(serverReference, reasonCode);
-        }
-        logger.log(
-          MqttLogLevel.warning,
-          'Broker sent DISCONNECT: $reasonCode',
-        );
+        _handleServerDisconnect(disconnect);
       default:
         break;
     }
+  }
+
+  /// Handles a DISCONNECT sent by the broker.
+  ///
+  /// The broker discards anything sent after it, so the connection is torn
+  /// down here rather than waiting for the peer to close the socket.
+  void _handleServerDisconnect(MqttDisconnectPacket disconnect) {
+    final reasonCode = disconnect.reasonCode;
+    String? serverReference;
+    for (final property in disconnect.properties) {
+      if (property is ServerReference) {
+        serverReference = property.value;
+      }
+    }
+    _connectionManager.serverReference = serverReference;
+    logger.log(MqttLogLevel.warning, 'Broker sent DISCONNECT: $reasonCode');
+    if (reasonCode == MqttReasonCode.useAnotherServer ||
+        reasonCode == MqttReasonCode.serverMoved) {
+      onServerMoved?.call(serverReference, reasonCode!);
+    }
+    _connected = false;
+    unawaited(_connectionManager.handleServerDisconnect(reasonCode));
   }
 
   void _completePending<T>(
@@ -559,7 +715,6 @@ final class MqttClient {
     if (entry == null) {
       return;
     }
-    _session.packetIds.release(puback.packetIdentifier);
     _flow.release();
     entry.completer.complete(
       MqttPublishResult(
@@ -577,7 +732,6 @@ final class MqttClient {
     final reasonCode = pubrec.reasonCode;
     if (reasonCode != null && reasonCode.value >= 0x80) {
       _session.outgoingQos2.remove(pubrec.packetIdentifier);
-      _session.packetIds.release(pubrec.packetIdentifier);
       _flow.release();
       entry.completer.complete(
         MqttPublishResult(reasonCode: reasonCode, properties: pubrec.properties),
@@ -588,6 +742,7 @@ final class MqttClient {
     _connectionManager.send(
       MqttPubrelPacket(packetIdentifier: pubrec.packetIdentifier),
     );
+    entry.state = OutgoingQos2State.pubRelSent;
   }
 
   void _handlePubrel(MqttPubrelPacket pubrel) {
@@ -607,7 +762,6 @@ final class MqttClient {
     if (entry == null) {
       return;
     }
-    _session.packetIds.release(pubcomp.packetIdentifier);
     _flow.release();
     entry.completer.complete(
       MqttPublishResult(
@@ -640,15 +794,28 @@ final class MqttClient {
       'Connected (sessionPresent=${connack.sessionPresent})',
     );
     if (connack.sessionPresent) {
-      unawaited(_resumeSession());
+      // Fire and forget: a failure here means the connection dropped again,
+      // which the transport reports on its own.
+      unawaited(_resumeSession().catchError((Object e) {
+        logger.log(MqttLogLevel.warning, 'Session resume interrupted: $e');
+      }));
     } else {
       _discardSession();
     }
   }
 
   void _applyServerCapabilities(MqttConnackPacket connack) {
+    // Capabilities are per-connection: an absent property means "default",
+    // so start from the defaults instead of keeping the previous connection's.
+    _capabilities.reset();
     for (final property in connack.properties) {
       switch (property) {
+        case AssignedClientIdentifier assigned:
+          _assignedClientId = assigned.value;
+          logger.log(
+            MqttLogLevel.info,
+            'Broker assigned client identifier ${assigned.value}',
+          );
         case ReceiveMaximum receiveMaximum:
           _capabilities.receiveMaximum = receiveMaximum.value;
         case MaximumPacketSize maximumPacketSize:
@@ -789,7 +956,7 @@ final class MqttClient {
           subscriptions: subscriptions,
         ),
       );
-      final suback = await completer.future;
+      final suback = await _awaitAck(completer.future, 'SUBACK');
       _throwIfSubackRejected(suback);
     } on MqttException catch (e) {
       logger.log(MqttLogLevel.warning, 'Re-subscribe failed: $e');
@@ -837,7 +1004,7 @@ final class MqttClient {
 
   MqttConnectPacket _buildConnectPacket() {
     return MqttConnectPacket(
-      clientId: clientId,
+      clientId: effectiveClientId,
       cleanStart: _cleanStart,
       keepAliveSeconds: _keepAliveSeconds,
       properties: [
@@ -865,5 +1032,25 @@ final class MqttClient {
     final random = Random.secure();
     final suffix = List.generate(8, (_) => random.nextInt(10)).join();
     return 'mqtt5-$suffix';
+  }
+}
+
+/// The topic name and properties to put on the wire for one publish, plus the
+/// alias binding to record once that publish has actually been written.
+final class _Aliased {
+  _Aliased(this.topic, this.properties, this._pending, this._aliases);
+
+  final String topic;
+  final List<MqttProperty> properties;
+  final ({int alias, String topic})? _pending;
+  final TopicAliasMap _aliases;
+
+  /// Binds a newly reserved alias, now that the broker has seen the full
+  /// topic name. A no-op when no new alias was reserved.
+  void commit() {
+    final pending = _pending;
+    if (pending != null) {
+      _aliases.commit(pending.alias, pending.topic);
+    }
   }
 }

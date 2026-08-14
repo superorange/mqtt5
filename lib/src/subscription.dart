@@ -1,3 +1,4 @@
+import 'exception/mqtt_exception.dart';
 import 'mqtt_qos.dart';
 
 /// MQTT Retain Handling subscription option (specification section 3.8.3.1).
@@ -38,12 +39,22 @@ final class MqttSubscriptionOptions {
     return value;
   }
 
+  /// Decodes the subscription options byte.
+  ///
+  /// Throws [MqttMalformedPacketException] if the byte encodes a reserved QoS
+  /// or Retain Handling value.
   static MqttSubscriptionOptions fromByte(int byte) {
+    final retainHandling = (byte >> 4) & 0x03;
+    if (retainHandling == 3) {
+      throw MqttMalformedPacketException(
+        'Invalid Retain Handling value: $retainHandling',
+      );
+    }
     return MqttSubscriptionOptions(
       qos: MqttQos.fromValue(byte & 0x03),
       noLocal: byte & 0x04 != 0,
       retainAsPublished: byte & 0x08 != 0,
-      retainHandling: MqttRetainHandling.values[(byte >> 4) & 0x03],
+      retainHandling: MqttRetainHandling.values[retainHandling],
     );
   }
 
