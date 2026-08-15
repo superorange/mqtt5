@@ -72,6 +72,11 @@ final class MqttPublishPacket extends MqttPacket
     }
     final retain = flags & 0x01 != 0;
     final qos = MqttQos.fromValue(qosValue);
+    if (qos == MqttQos.atMostOnce && dup) {
+      throw MqttMalformedPacketException(
+        'PUBLISH DUP flag must be 0 for QoS 0 messages',
+      );
+    }
 
     final topicName = MqttUtf8.decode(reader);
     int packetIdentifier = 0;

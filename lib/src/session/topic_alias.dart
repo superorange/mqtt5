@@ -39,6 +39,21 @@ final class TopicAliasMap {
     if (existing != null) {
       return existing;
     }
+    final candidate = reserve();
+    if (candidate == null) {
+      return null;
+    }
+    commit(candidate, topic);
+    return candidate;
+  }
+
+  /// Reserves the next free alias without binding it to a topic, or returns
+  /// null when the alias space is exhausted.
+  ///
+  /// The caller must [commit] the alias only once the PUBLISH carrying the
+  /// full topic name has actually been written: a mapping the server never
+  /// saw would make every later publish reference an unknown alias.
+  int? reserve() {
     if (maximum <= 0) {
       return null;
     }
@@ -46,12 +61,16 @@ final class TopicAliasMap {
       final candidate = _next;
       _next = _next >= maximum ? 1 : _next + 1;
       if (!_byAlias.containsKey(candidate)) {
-        _byAlias[candidate] = topic;
-        _byTopic[topic] = candidate;
         return candidate;
       }
     }
     return null;
+  }
+
+  /// Binds a reserved alias to [topic].
+  void commit(int alias, String topic) {
+    _byAlias[alias] = topic;
+    _byTopic[topic] = alias;
   }
 
   void reset() {

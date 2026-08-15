@@ -60,6 +60,12 @@ class MqttServerRejectedException extends MqttException {
   final int reasonCode;
 }
 
+/// An exception thrown when the broker does not acknowledge an operation
+/// within the configured timeout.
+class MqttTimeoutException extends MqttException {
+  MqttTimeoutException(super.message, [super.cause]);
+}
+
 /// An exception thrown when flow control constraints would be violated.
 class MqttFlowControlException extends MqttException {
   MqttFlowControlException(super.message, [super.cause]);

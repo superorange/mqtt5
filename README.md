@@ -1,47 +1,34 @@
 # mqtt5
 
-A pure-Dart MQTT 5.0 client library. No Flutter, no third-party MQTT
-dependencies — just `dart:io` sockets, `SecureSocket` for TLS, and a
-spec-first protocol engine.
+An MQTT 5.0 client for Dart, written against the
+[OASIS spec](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).
+Pure Dart, no Flutter dependency and no third-party MQTT code: just `dart:io`
+sockets, plus `SecureSocket` for TLS.
 
-## Design goals
+It runs anywhere `dart:io` runs: Linux, macOS, Windows, Android, iOS. Not the
+web, since there are no raw sockets there. The transport is behind an
+interface, so a WebSocket transport can be dropped in later.
 
-- MQTT 5.0 first-class: the full property system, all 15 control packets,
-  every reason code, QoS 0/1/2 state machines, session resume.
-- Codec, transport, protocol state machine and public API are separate layers.
-- Correct over fast: protocol behaviour is implemented per the
-  [OASIS MQTT 5.0 specification](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html),
-  not from memory.
-- Long-running stability: automatic reconnect, half-open TCP detection via
-  keep alive, and fuzz/fragmentation-tested incremental decoding.
+```bash
+dart pub add mqtt5
+```
 
-## Supported platforms
-
-Any platform supported by `dart:io`: Linux, macOS, Windows, Android and iOS
-(native). Web is not supported because `dart:io` sockets are unavailable; the
-transport layer is an interface so a WebSocket transport can be added.
-
-## Quick start
+## Getting started
 
 ```dart
 import 'dart:convert';
 import 'package:mqtt5/mqtt5.dart';
 
 final client = MqttClient(
-  clientId: 'cmd-001',
   host: '192.168.1.100',
-  port: 1883,
+  clientId: 'cmd-001',
 );
 
 client.messages.listen((message) {
   print('${message.topic}: ${utf8.decode(message.payload)}');
 });
 
-await client.connect(
-  cleanStart: false,
-  keepAlive: const Duration(seconds: 30),
-  sessionExpiryInterval: const Duration(hours: 1),
-);
+await client.connect(keepAlive: const Duration(seconds: 30));
 
 await client.subscribe(
   'device/+/status',
@@ -52,71 +39,82 @@ await client.publish(
   'device/U1-001/action',
   utf8.encode('{"action":"pause"}'),
   qos: MqttQos.atLeastOnce,
-  properties: [
-    const UserProperty('traceId', '123'),
-  ],
+  properties: [const UserProperty('traceId', '123')],
 );
 
-await client.disconnect();
+await client.close();
 ```
 
-## MQTT 5 feature matrix
+`disconnect()` hangs up but leaves the client reusable, so you can `connect()`
+again. `close()` also closes the `messages`, `stateStream` and `errors`
+streams and is the end of the road for that client.
 
-| Feature | Status |
-| --- | --- |
-| CONNECT / CONNACK (all properties) | ✅ Supported |
-| Clean Start / Session Expiry Interval | ✅ Supported |
-| Session Present / session resume | ✅ Supported |
-| QoS 0 / 1 / 2 publish and subscribe | ✅ Supported |
-| PUBACK/PUBREC/PUBREL/PUBCOMP state machines | ✅ Supported |
-| Incoming QoS 2 de-duplication | ✅ Supported |
-| Automatic reconnect (backoff + jitter) | ✅ Supported |
-| Retransmit unacknowledged messages on resume (DUP) | ✅ Supported |
-| Automatic re-subscribe per session semantics | ✅ Supported |
-| Keep Alive / PINGREQ / PINGRESP | ✅ Supported |
-| Server Keep Alive override | ✅ Supported |
-| Half-open TCP detection | ✅ Supported |
-| Last Will and Testament | ✅ Supported |
-| Enhanced authentication (AUTH) | ✅ Supported |
-| Receive Maximum (outgoing flow control) | ✅ Supported |
-| Maximum Packet Size (send and receive) | ✅ Supported |
-| Maximum QoS | ✅ Supported |
-| Retain Available | ✅ Supported |
-| Topic Alias (both directions) | ✅ Supported |
-| Subscription Identifier | ✅ Supported |
-| Shared / Wildcard subscriptions (with capability checks) | ✅ Supported |
-| User Properties | ✅ Supported |
-| Request / Response properties | ✅ Supported |
-| All MQTT 5 reason codes | ✅ Supported |
-| Server redirection (Use another server / Server moved) | ✅ Exposed |
-| TLS (CA, client cert, SNI, ALPN) | ✅ Supported |
-| Runtime metrics | ✅ Supported |
-| WebSocket transport | ⏳ Planned (transport is pluggable) |
+## What publish actually waits for
 
-## QoS semantics
+QoS 0 returns as soon as the bytes are written. QoS 1 returns when PUBACK
+arrives, QoS 2 when PUBCOMP does. The returned `MqttPublishResult` carries the
+broker's reason code and properties, so you can tell the difference between a
+message that was delivered and one the broker accepted with
+`noMatchingSubscribers` because nobody was listening.
 
-- `publish(..., qos: MqttQos.atMostOnce)` completes once the packet is written.
-- `publish(..., qos: MqttQos.atLeastOnce)` completes when PUBACK arrives.
-- `publish(..., qos: MqttQos.exactlyOnce)` completes when PUBCOMP arrives.
+If nothing comes back within `operationTimeout` (30 seconds by default), the
+call throws `MqttTimeoutException`. That applies to `subscribe` and
+`unsubscribe` too. Pass `Duration.zero` if you would rather wait forever.
 
-On reconnect the client never re-sends acknowledged messages; unacknowledged
-PUBLISH packets are retransmitted with `DUP=1` and outstanding PUBREL packets
-are retransmitted, exactly as required by the session semantics.
-
-## Session and reconnect
+## Sessions and reconnecting
 
 ```dart
 await client.connect(
   cleanStart: false,
-  keepAlive: const Duration(seconds: 30),
   sessionExpiryInterval: const Duration(hours: 1),
 );
 ```
 
-With `cleanStart: false` the broker resumes the session if it is still alive.
-The client restores in-flight QoS 1/2 state and does not re-subscribe. If the
-session was lost, in-flight publishes fail and known subscriptions are
-re-established automatically.
+With `cleanStart: false` the broker resumes your session if it still has it.
+In-flight QoS 1/2 messages are retransmitted with DUP set, outstanding PUBRELs
+are re-sent, and subscriptions are left alone because the broker still has
+them. If the session turned out to be gone, in-flight publishes fail and the
+client re-subscribes to everything it knows about.
+
+Dropped connections come back with exponential backoff and jitter. Half-open
+TCP connections are caught by keep alive, so a connection that silently died
+gets noticed instead of hanging forever.
+
+Pass `autoReconnect: false` to turn all of that off. Then `connect()` throws on
+the first failure, and a later drop just leaves the client disconnected.
+
+The first `connect()` throws if the broker refuses you. After that there is no
+caller left to throw at, so anything fatal on a later reconnect shows up here:
+
+```dart
+client.errors.listen((error) {
+  // Credentials revoked, broker moved, protocol error. The client has stopped.
+});
+```
+
+Some reason codes will never get better on a retry: Banned, Not Authorized,
+Server Moved, Use Another Server, Bad Authentication Method. Those stop the
+client instead of hammering a broker that keeps saying no.
+
+## MQTT 5 features
+
+All 15 control packets, the full property system and every reason code in the
+spec are implemented. Beyond the obvious ones, the pieces worth knowing about:
+
+Receive Maximum is honoured for outgoing QoS 1/2, so the client stays inside
+the broker's in-flight window instead of getting disconnected for overrunning
+it. Topic Alias works in both directions and is negotiated from CONNACK.
+
+Server capabilities are enforced locally. Publishing at QoS 2 to a broker that
+advertises Maximum QoS 1, or with `retain: true` where retain is unavailable,
+fails on the spot rather than getting you kicked off the connection.
+
+There is also Last Will and Testament with will properties, Maximum Packet
+Size in both directions, Subscription Identifiers (read them off a received
+message with `message.subscriptionIdentifiers`), and enhanced authentication,
+including answering a broker's re-authentication challenge mid-session.
+
+WebSocket transport is the one real gap.
 
 ## TLS
 
@@ -133,7 +131,12 @@ final client = MqttClient(
 );
 ```
 
+Leave `securityContext` off to use the platform's trusted roots. ALPN and a
+custom `onBadCertificate` are available on the constructor.
+
 ## Enhanced authentication
+
+Implement `MqttAuthenticator` and answer each challenge the broker sends:
 
 ```dart
 final client = MqttClient(
@@ -147,31 +150,51 @@ await client.connect(
 );
 ```
 
-Implement `MqttAuthenticator` to respond to each challenge.
+## When something is wrong
 
-## Troubleshooting
+Turn on logging:
 
-- Use `MqttClient(logger: PrintLogger(minimumLevel: MqttLogLevel.debug))` for
-  connection, QoS state, reconnect and PING diagnostics.
-- `client.metrics` exposes bytes, packets, messages, reconnect count and PING
-  RTT.
-- `client.state` / `client.stateStream` expose the connection lifecycle.
+```dart
+MqttClient(
+  host: 'broker.example.com',
+  logger: PrintLogger(minimumLevel: MqttLogLevel.debug),
+);
+```
 
-## Limitations
+`client.state` and `client.stateStream` follow the connection lifecycle, and
+`client.metrics` counts bytes, packets, messages, reconnects, protocol errors
+and the last PING round trip.
 
-- WebSocket transport is not implemented yet.
-- The client does not automatically follow `Server Reference` redirects; it
-  surfaces them via `MqttServerMovedException` (on connect) and the
-  `onServerMoved` callback (on DISCONNECT).
-- TLS session resumption (RFC 5077) is left to the platform TLS stack.
+For testing your own code against the client without a broker, there is an
+in-memory transport:
+
+```dart
+import 'package:mqtt5/testing.dart';
+
+final transport = MemoryTransport();
+final client = MqttClient(host: 'x', transportFactory: () => transport);
+```
+
+## Things to know
+
+Session state lives in memory. It survives a reconnect, not a process restart.
+
+The client will not chase a `Server Reference` redirect for you. It stops and
+reports the new address through `onServerMoved` and `MqttServerMovedException`;
+building a client for the new address is your call.
+
+TLS session resumption is whatever the platform TLS stack does on its own.
 
 ## Development
 
 ```bash
-dart analyze
-dart test                       # unit + property + packet + state machine tests
-dart test test/integration      # requires mosquitto at /opt/homebrew/sbin/mosquitto
-dart run tool/benchmark.dart    # codec micro-benchmarks
+dart test                    # unit, property and state machine tests
+dart test test/integration   # needs mosquitto; skipped if it is not installed
+dart run tool/benchmark.dart
 dart run tool/soak_test.dart --host 127.0.0.1 --port 18883 --duration 3600
 dart run tool/chaos_test.dart --rounds 20
 ```
+
+The integration suite runs against a real mosquitto instance it starts itself.
+`tool/chaos_test.dart` kills the broker at random points and checks the client
+recovers; `tool/soak_test.dart` is for leaving running overnight.
