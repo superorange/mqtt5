@@ -5,7 +5,7 @@ repository: https://github.com/superorange/mqtt5
 issue_tracker: https://github.com/superorange/mqtt5/issues
 
 environment:
-  sdk: ^3.8.0
+  sdk: ^3.0.0
 
 dev_dependencies:
   lints: ^6.1.0

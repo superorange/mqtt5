@@ -5,8 +5,6 @@ regression tests.
 
 ### Breaking
 
-- The minimum SDK is now Dart 3.8 (the declared `^3.0.0` never actually
-  resolved: `lints ^6.1.0` requires `^3.8.0`).
 - `lib/mqtt5.dart` no longer exports internal machinery (`ConnectionManager`,
   `FlowController`, `KeepAliveManager`, `PacketIdentifierPool`, `MqttSession`
   and the session stores). `MemoryTransport` moved to
