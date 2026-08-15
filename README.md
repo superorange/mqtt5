@@ -2,8 +2,8 @@
 
 An MQTT 5.0 client for Dart, written against the
 [OASIS spec](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html).
-Pure Dart, no Flutter dependency, no third-party MQTT code — just `dart:io`
-sockets and `SecureSocket` for TLS.
+Pure Dart, no Flutter dependency and no third-party MQTT code: just `dart:io`
+sockets, plus `SecureSocket` for TLS.
 
 It runs anywhere `dart:io` runs: Linux, macOS, Windows, Android, iOS. Not the
 web, since there are no raw sockets there. The transport is behind an
@@ -53,8 +53,9 @@ streams and is the end of the road for that client.
 
 QoS 0 returns as soon as the bytes are written. QoS 1 returns when PUBACK
 arrives, QoS 2 when PUBCOMP does. The returned `MqttPublishResult` carries the
-broker's reason code and properties, so a broker that accepts a message with
-`noMatchingSubscribers` is visible to you rather than silently swallowed.
+broker's reason code and properties, so you can tell the difference between a
+message that was delivered and one the broker accepted with
+`noMatchingSubscribers` because nobody was listening.
 
 If nothing comes back within `operationTimeout` (30 seconds by default), the
 call throws `MqttTimeoutException`. That applies to `subscribe` and
@@ -79,8 +80,8 @@ Dropped connections come back with exponential backoff and jitter. Half-open
 TCP connections are caught by keep alive, so a connection that silently died
 gets noticed instead of hanging forever.
 
-Turn all of that off with `autoReconnect: false` — then `connect()` throws on
-the first failure and a later drop just leaves the client disconnected.
+Pass `autoReconnect: false` to turn all of that off. Then `connect()` throws on
+the first failure, and a later drop just leaves the client disconnected.
 
 The first `connect()` throws if the broker refuses you. After that there is no
 caller left to throw at, so anything fatal on a later reconnect shows up here:
@@ -91,30 +92,29 @@ client.errors.listen((error) {
 });
 ```
 
-Reason codes that will not get better on a retry — Banned, Not Authorized,
-Server Moved, Use Another Server, Bad Authentication Method — stop the client
-instead of hammering a broker that keeps saying no.
+Some reason codes will never get better on a retry: Banned, Not Authorized,
+Server Moved, Use Another Server, Bad Authentication Method. Those stop the
+client instead of hammering a broker that keeps saying no.
 
 ## MQTT 5 features
 
-All 15 control packets and the full property system are implemented, along
-with every reason code in the spec. The parts you are most likely to care
-about:
+All 15 control packets, the full property system and every reason code in the
+spec are implemented. Beyond the obvious ones, the pieces worth knowing about:
 
-- **Flow control.** Receive Maximum is honoured for outgoing QoS 1/2, so the
-  client will not exceed the broker's in-flight window.
-- **Topic Alias**, both directions, negotiated from CONNACK.
-- **Server capabilities** are enforced locally: publishing at QoS 2 to a
-  broker that advertises Maximum QoS 1, or with `retain: true` where retain is
-  unavailable, fails immediately instead of getting you disconnected.
-- **Subscription Identifiers**, available on received messages via
-  `message.subscriptionIdentifiers`.
-- **Enhanced authentication** (AUTH), including answering a broker's
-  re-authentication challenge mid-session.
-- **Last Will and Testament** with all will properties.
-- **Maximum Packet Size** in both directions.
+Receive Maximum is honoured for outgoing QoS 1/2, so the client stays inside
+the broker's in-flight window instead of getting disconnected for overrunning
+it. Topic Alias works in both directions and is negotiated from CONNACK.
 
-WebSocket transport is the notable gap.
+Server capabilities are enforced locally. Publishing at QoS 2 to a broker that
+advertises Maximum QoS 1, or with `retain: true` where retain is unavailable,
+fails on the spot rather than getting you kicked off the connection.
+
+There is also Last Will and Testament with will properties, Maximum Packet
+Size in both directions, Subscription Identifiers (read them off a received
+message with `message.subscriptionIdentifiers`), and enhanced authentication,
+including answering a broker's re-authentication challenge mid-session.
+
+WebSocket transport is the one real gap.
 
 ## TLS
 
