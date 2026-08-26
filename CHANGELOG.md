@@ -7,6 +7,8 @@ and terminating the process.
 - TLS handshake and protocol errors are treated as terminal. A background
   failure is reported through `MqttClient.errors` instead of escaping as an
   unhandled asynchronous exception.
+- `isRetryableMqttConnectionError` exposes the same retry decision to wrapper
+  libraries, so reconnect policy does not have to duplicate MQTT reason codes.
 - Transport errors received while waiting for CONNACK fail the connection
   immediately instead of waiting for `connackTimeout`.
 - Connection-loss handling is serialized so duplicate socket error/done events
@@ -26,6 +28,10 @@ and terminating the process.
   are rejected before network I/O.
 - `MqttException.toString()` now includes the concrete exception type and its
   underlying cause, which makes TLS and transport logs more useful.
+- `PrintLogger.minimumLevel` now keeps messages at that severity and above;
+  warning and error messages were previously filtered in the wrong direction.
+- Exceptions thrown by an application-provided logger are contained; logging
+  can no longer interrupt packet handling, cleanup, or reconnect work.
 - Added regression tests for handshake failures, terminal reconnect failures,
   reconnect cancellation, cleanup errors and packet identifier reset.
 - Reworked the README to keep the setup, TLS notes and runtime behavior easier

@@ -1,3 +1,31 @@
+import 'dart:io';
+
+/// Whether retrying the same MQTT connection settings may make progress.
+///
+/// Network failures and temporary broker rejections are retryable. TLS,
+/// protocol, authentication and permanent CONNACK rejections are not.
+bool isRetryableMqttConnectionError(Object error) {
+  if (error is TlsException ||
+      error is MqttProtocolException ||
+      error is MqttAuthenticationException ||
+      error is MqttServerMovedException) {
+    return false;
+  }
+  if (error is MqttServerRejectedException) {
+    return _retryableConnackReasonCodes.contains(error.reasonCode);
+  }
+  return true;
+}
+
+const _retryableConnackReasonCodes = <int>{
+  0x80, // Unspecified error
+  0x83, // Implementation specific error
+  0x88, // Server unavailable
+  0x89, // Server busy
+  0x97, // Quota exceeded
+  0x9F, // Connection rate exceeded
+};
+
 /// Base class for all MQTT related exceptions thrown by this library.
 class MqttException implements Exception {
   MqttException(this.message, [this.cause]);

@@ -53,13 +53,14 @@ final class MqttClient {
     this.will,
     this.username,
     this.password,
-    this.logger = const SilentLogger(),
+    MqttLogger logger = const SilentLogger(),
     this.reconnectManager,
     this.authenticator,
     this.transportFactory,
     this.autoReconnect = true,
     this.operationTimeout = const Duration(seconds: 30),
-  }) : clientId = clientId ?? _generateClientId() {
+  })  : logger = _GuardedMqttLogger(logger),
+        clientId = clientId ?? _generateClientId() {
     if (port < 1 || port > 0xFFFF) {
       throw ArgumentError.value(port, 'port', 'Must be between 1 and 65535');
     }
@@ -84,7 +85,7 @@ final class MqttClient {
       onConnectionLost: _onConnectionLost,
       onFatalError: _onFatalError,
       autoReconnect: autoReconnect,
-      logger: logger,
+      logger: this.logger,
       reconnectManager: reconnectManager,
     );
   }
@@ -1100,6 +1101,24 @@ final class MqttClient {
     final random = Random.secure();
     final suffix = List.generate(8, (_) => random.nextInt(10)).join();
     return 'mqtt5-$suffix';
+  }
+}
+
+/// Logging is an observer boundary. A broken application logger must not
+/// interrupt packet handling, reconnect cleanup or the keep-alive timer.
+final class _GuardedMqttLogger implements MqttLogger {
+  const _GuardedMqttLogger(this.delegate);
+
+  final MqttLogger delegate;
+
+  @override
+  void log(MqttLogLevel level, String message) {
+    try {
+      delegate.log(level, message);
+    } on Object {
+      // There is deliberately no fallback logger here: it could fail for the
+      // same reason (for example a closed stdout pipe).
+    }
   }
 }
 

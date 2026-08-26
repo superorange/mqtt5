@@ -31,7 +31,9 @@ final class PrintLogger implements MqttLogger {
 
   @override
   void log(MqttLogLevel level, String message) {
-    if (level.index > minimumLevel.index) {
+    if (minimumLevel == MqttLogLevel.none ||
+        level == MqttLogLevel.none ||
+        level.index < minimumLevel.index) {
       return;
     }
     print('mqtt5 [${level.name}] $message');

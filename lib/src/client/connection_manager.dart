@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:typed_data';
 
 import '../codec/mqtt_packet_decoder.dart';
@@ -21,16 +20,6 @@ import 'mqtt_authenticator.dart';
 import 'mqtt_connection_state.dart';
 import 'mqtt_metrics.dart';
 import 'reconnect_manager.dart';
-
-/// CONNACK reason codes that warrant a retry rather than surfacing an error.
-const Set<int> retryableConnackReasonCodes = {
-  0x80, // Unspecified error
-  0x83, // Implementation specific error
-  0x88, // Server unavailable
-  0x89, // Server busy
-  0x97, // Quota exceeded
-  0x9F, // Connection rate exceeded
-};
 
 /// Manages the transport lifecycle: connecting, the CONNECT/CONNACK
 /// handshake, the inbound packet loop, keep alive and reconnection.
@@ -301,23 +290,7 @@ final class ConnectionManager {
   }
 
   bool _isFatal(Object error) {
-    // TLS handshake failures are normally configuration, certificate or peer
-    // trust failures. Retrying the same credentials forever cannot repair
-    // them; surface the failure so the owner can refresh credentials.
-    if (error is TlsException) {
-      return true;
-    }
-    if (error is MqttProtocolException) {
-      return true;
-    }
-    if (error is MqttServerMovedException ||
-        error is MqttAuthenticationException) {
-      return true;
-    }
-    if (error is MqttServerRejectedException) {
-      return !retryableConnackReasonCodes.contains(error.reasonCode);
-    }
-    return false;
+    return !isRetryableMqttConnectionError(error);
   }
 
   MqttConnackPacket? _lastConnack;
