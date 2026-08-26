@@ -1,3 +1,36 @@
+## 0.3.0
+
+This release focuses on connection failures and reconnect cleanup. The main
+case behind it was a TLS handshake error escaping from a background reconnect
+and terminating the process.
+
+- TLS handshake and protocol errors are treated as terminal. A background
+  failure is reported through `MqttClient.errors` instead of escaping as an
+  unhandled asynchronous exception.
+- Transport errors received while waiting for CONNACK fail the connection
+  immediately instead of waiting for `connackTimeout`.
+- Connection-loss handling is serialized so duplicate socket error/done events
+  cannot start overlapping teardown or reconnect work.
+- `disconnect()` cancels a pending reconnect delay and waits for the old
+  connection loop to finish before another `connect()` can start.
+- Transport listener cancellation and socket close failures are contained and
+  logged instead of escaping from background cleanup.
+- With `autoReconnect: false`, a connection lost after startup is also emitted
+  on `MqttClient.errors`.
+- Socket transports emit only one terminal event and keep the original stack
+  trace when forwarding an error.
+- Fatal disconnect errors are passed to pending publish, subscribe and
+  unsubscribe operations.
+- Resetting an exhausted packet identifier pool now wakes blocked allocators.
+- Invalid port, timeout, reconnect, CONNECT and TLS client-certificate settings
+  are rejected before network I/O.
+- `MqttException.toString()` now includes the concrete exception type and its
+  underlying cause, which makes TLS and transport logs more useful.
+- Added regression tests for handshake failures, terminal reconnect failures,
+  reconnect cancellation, cleanup errors and packet identifier reset.
+- Reworked the README to keep the setup, TLS notes and runtime behavior easier
+  to find.
+
 ## 0.2.0
 
 Bug fixes, almost all of them in the connection lifecycle rather than the

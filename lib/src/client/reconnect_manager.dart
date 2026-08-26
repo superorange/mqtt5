@@ -7,7 +7,29 @@ final class ReconnectManager {
     this.maxDelay = const Duration(seconds: 30),
     this.jitterFactor = 0.2,
     Random? random,
-  }) : _random = random ?? Random();
+  }) : _random = random ?? Random() {
+    if (initialDelay < Duration.zero) {
+      throw ArgumentError.value(
+        initialDelay,
+        'initialDelay',
+        'Must not be negative',
+      );
+    }
+    if (maxDelay < initialDelay) {
+      throw ArgumentError.value(
+        maxDelay,
+        'maxDelay',
+        'Must be greater than or equal to initialDelay',
+      );
+    }
+    if (jitterFactor < 0 || jitterFactor > 1) {
+      throw ArgumentError.value(
+        jitterFactor,
+        'jitterFactor',
+        'Must be between 0 and 1',
+      );
+    }
+  }
 
   final Duration initialDelay;
   final Duration maxDelay;

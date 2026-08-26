@@ -41,7 +41,20 @@ final class TlsTransport extends MqttSocketTransport {
     String? privateKey,
     String? keyPassword,
   }) {
-    final context = SecurityContext(withTrustedRoots: trustedCertificates == null);
+    if ((certificateChain == null) != (privateKey == null)) {
+      throw ArgumentError(
+        'certificateChain and privateKey must be provided together',
+      );
+    }
+    if (keyPassword != null && privateKey == null) {
+      throw ArgumentError.value(
+        keyPassword,
+        'keyPassword',
+        'Requires privateKey',
+      );
+    }
+    final context =
+        SecurityContext(withTrustedRoots: trustedCertificates == null);
     if (trustedCertificates != null) {
       context.setTrustedCertificatesBytes(
         _asBytes(trustedCertificates),

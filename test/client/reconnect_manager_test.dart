@@ -47,5 +47,27 @@ void main() {
       manager.reset();
       expect(manager.nextDelay(), const Duration(seconds: 1));
     });
+
+    test('rejects invalid backoff configuration eagerly', () {
+      expect(
+        () => ReconnectManager(initialDelay: const Duration(milliseconds: -1)),
+        throwsArgumentError,
+      );
+      expect(
+        () => ReconnectManager(
+          initialDelay: const Duration(seconds: 2),
+          maxDelay: const Duration(seconds: 1),
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => ReconnectManager(jitterFactor: -0.1),
+        throwsArgumentError,
+      );
+      expect(
+        () => ReconnectManager(jitterFactor: 1.1),
+        throwsArgumentError,
+      );
+    });
   });
 }

@@ -69,13 +69,26 @@ void main() {
 
     test('throws incomplete on over-read', () {
       final r = MqttReader(Uint8List.fromList([0x01]));
-      expect(() => r.readUint16(), throwsA(isA<MqttIncompletePacketException>()));
-      expect(() => r.readBytes(2), throwsA(isA<MqttIncompletePacketException>()));
+      expect(
+          () => r.readUint16(), throwsA(isA<MqttIncompletePacketException>()));
+      expect(
+          () => r.readBytes(2), throwsA(isA<MqttIncompletePacketException>()));
     });
 
     test('throws malformed on negative length', () {
       final r = MqttReader(Uint8List.fromList([0x01]));
-      expect(() => r.readBytes(-1), throwsA(isA<MqttMalformedPacketException>()));
+      expect(
+          () => r.readBytes(-1), throwsA(isA<MqttMalformedPacketException>()));
     });
+  });
+
+  test('MqttException includes its subtype and cause in diagnostics', () {
+    final exception = MqttTransportException(
+      'TLS handshake failed',
+      StateError('certificate rejected'),
+    );
+
+    expect(exception.toString(), contains('MqttTransportException'));
+    expect(exception.toString(), contains('certificate rejected'));
   });
 }

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:mqtt5/src/transport/tcp_transport.dart';
+import 'package:mqtt5/src/transport/tls_transport.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -68,6 +69,21 @@ void main() {
     expect(
       () => transport.add(Uint8List.fromList([1])),
       throwsA(isA<Exception>()),
+    );
+  });
+
+  test('TLS context requires a complete client identity', () {
+    expect(
+      () => TlsTransport.createSecurityContext(certificateChain: 'certificate'),
+      throwsArgumentError,
+    );
+    expect(
+      () => TlsTransport.createSecurityContext(privateKey: 'private key'),
+      throwsArgumentError,
+    );
+    expect(
+      () => TlsTransport.createSecurityContext(keyPassword: 'secret'),
+      throwsArgumentError,
     );
   });
 }

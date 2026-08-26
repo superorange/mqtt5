@@ -24,6 +24,7 @@ abstract class MqttSocketTransport implements MqttTransport {
       StreamController<Uint8List>.broadcast(sync: true);
   bool _connected = false;
   bool _closed = false;
+  bool _terminalEventSent = false;
 
   @override
   Stream<Uint8List> get incoming => _incoming.stream;
@@ -42,6 +43,7 @@ abstract class MqttSocketTransport implements MqttTransport {
     _socket = socket;
     _connected = true;
     _closed = false;
+    _terminalEventSent = false;
     socket.listen(
       _onData,
       onError: _onError,
@@ -59,21 +61,24 @@ abstract class MqttSocketTransport implements MqttTransport {
     _incoming.add(data);
   }
 
-  void _onError(Object error) {
-    if (_closed) {
+  void _onError(Object error, StackTrace stackTrace) {
+    if (_closed || _terminalEventSent) {
       return;
     }
+    _terminalEventSent = true;
     _connected = false;
-    _incoming.addError(error);
+    _incoming.addError(error, stackTrace);
   }
 
   void _onDone() {
-    if (_closed) {
+    if (_closed || _terminalEventSent) {
       return;
     }
+    _terminalEventSent = true;
     _connected = false;
     _incoming.addError(
       MqttTransportException('Connection closed by peer'),
+      StackTrace.current,
     );
   }
 

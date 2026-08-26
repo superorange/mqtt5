@@ -10,3 +10,6 @@ goal.md
 
 # IDE configuration
 .idea/
+
+# FVM Version Cache
+.fvm/

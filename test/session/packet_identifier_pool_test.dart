@@ -40,7 +40,8 @@ void main() {
       pool.reserve(10);
       expect(() => pool.reserve(10), throwsA(isA<MqttFlowControlException>()));
       expect(() => pool.reserve(0), throwsA(isA<MqttFlowControlException>()));
-      expect(() => pool.reserve(65536), throwsA(isA<MqttFlowControlException>()));
+      expect(
+          () => pool.reserve(65536), throwsA(isA<MqttFlowControlException>()));
     });
 
     test('wraps around at 65535', () {
@@ -73,6 +74,22 @@ void main() {
       pool.reserve(3);
       pool.reset();
       expect(pool.tryAllocate(), 1);
+    });
+
+    test('reset wakes an allocator waiting on exhaustion', () async {
+      final pool = PacketIdentifierPool();
+      for (var i = 1; i <= PacketIdentifierPool.maxIdentifier; i++) {
+        pool.reserve(i);
+      }
+
+      final waiting = pool.allocate();
+      await Future<void>.delayed(Duration.zero);
+      pool.reset();
+
+      expect(
+        await waiting.timeout(const Duration(seconds: 1)),
+        1,
+      );
     });
   });
 }

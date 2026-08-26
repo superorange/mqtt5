@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
 
 import '../codec/mqtt_packet_decoder.dart';
 import '../exception/mqtt_exception.dart';
@@ -13,12 +15,11 @@ import '../packet/mqtt_reason_code.dart';
 import '../packet/pingreq.dart';
 import '../packet/pingresp.dart';
 import '../property/mqtt_property.dart';
-import 'dart:typed_data';
-import 'mqtt_metrics.dart';
 import '../transport/mqtt_transport.dart';
 import 'keep_alive_manager.dart';
 import 'mqtt_authenticator.dart';
 import 'mqtt_connection_state.dart';
+import 'mqtt_metrics.dart';
 import 'reconnect_manager.dart';
 
 /// CONNACK reason codes that warrant a retry rather than surfacing an error.
@@ -98,8 +99,10 @@ final class ConnectionManager {
   Completer<MqttConnackPacket>? _connackCompleter;
   Timer? _connackTimer;
   bool _running = false;
-  bool _runActive = false;
   bool _disposed = false;
+  Future<void>? _activeRun;
+  Future<void>? _activeConnectionLoss;
+  Completer<void>? _retryCancellation;
 
   MqttConnectionState get state => _state;
 
@@ -115,10 +118,12 @@ final class ConnectionManager {
     }
     _connectPacketBuilder = connectPacketBuilder;
     if (_running) {
+      await _activeRun;
       return;
     }
+    _reconnect.reset();
     _running = true;
-    await _run(initial: true);
+    await _startRun(initial: true);
   }
 
   /// Marks the start of a client-initiated disconnect, so observers see the
@@ -132,6 +137,10 @@ final class ConnectionManager {
   /// Stops the loop and closes the transport. No reconnect is attempted.
   Future<void> stop() async {
     _running = false;
+    final retryCancellation = _retryCancellation;
+    if (retryCancellation != null && !retryCancellation.isCompleted) {
+      retryCancellation.complete();
+    }
     _connackTimer?.cancel();
     _connackTimer = null;
     if (_connackCompleter != null && !_connackCompleter!.isCompleted) {
@@ -141,6 +150,18 @@ final class ConnectionManager {
     }
     _keepAlive.stop();
     await _teardownTransport();
+    await _activeConnectionLoss;
+    final activeRun = _activeRun;
+    if (activeRun != null) {
+      try {
+        await activeRun;
+      } on Exception catch (error) {
+        logger.log(
+          MqttLogLevel.debug,
+          'Connection loop stopped with an already reported error: $error',
+        );
+      }
+    }
     _setState(MqttConnectionState.disconnected);
   }
 
@@ -189,44 +210,76 @@ final class ConnectionManager {
   /// result: errors that end the loop are rethrown to them. Runs started from
   /// a connection-lost callback have no such caller, so their errors go to
   /// [onFatalError] instead of escaping as unhandled asynchronous errors.
-  Future<void> _run({bool initial = false}) async {
-    if (_runActive) {
-      return;
+  Future<void> _startRun({required bool initial}) {
+    final active = _activeRun;
+    if (active != null) {
+      return active;
     }
-    _runActive = true;
+    final run = _runTracked(initial: initial);
+    _activeRun = run;
+    return run;
+  }
+
+  Future<void> _runTracked({required bool initial}) async {
     try {
-      while (_running) {
-        _setState(_reconnect.attempt == 0
-            ? MqttConnectionState.connecting
-            : MqttConnectionState.reconnecting);
-        try {
-          await _attemptConnect();
-          _reconnect.reset();
-          _setState(MqttConnectionState.connected);
-          onConnected(_lastConnack!);
-          return;
-        } on Object catch (e, s) {
-          if (!_running) {
-            break;
-          }
-          if (_isFatal(e) || !autoReconnect) {
-            await _abort(e, s, rethrowToCaller: initial);
-            return;
-          }
-          await _teardownTransport();
-          _setState(MqttConnectionState.reconnecting);
-          metrics.reconnectCount++;
-          final delay = _reconnect.nextDelay();
-          logger.log(
-            MqttLogLevel.warning,
-            'Connection failed (${_reconnect.attempt}): $e; '
-            'retrying in ${delay.inMilliseconds} ms',
-          );
-          await Future<void>.delayed(delay);
-        }
-      }
+      await _run(initial: initial);
     } finally {
-      _runActive = false;
+      _activeRun = null;
+    }
+  }
+
+  Future<void> _run({required bool initial}) async {
+    while (_running) {
+      _setState(_reconnect.attempt == 0
+          ? MqttConnectionState.connecting
+          : MqttConnectionState.reconnecting);
+      try {
+        await _attemptConnect();
+        _reconnect.reset();
+        _setState(MqttConnectionState.connected);
+        onConnected(_lastConnack!);
+        return;
+      } on Exception catch (error, stackTrace) {
+        if (!_running) {
+          return;
+        }
+        if (_isFatal(error) || !autoReconnect) {
+          await _abort(
+            error,
+            stackTrace,
+            rethrowToCaller: initial,
+          );
+          return;
+        }
+        await _teardownTransport();
+        if (!_running) {
+          return;
+        }
+        _setState(MqttConnectionState.reconnecting);
+        metrics.reconnectCount++;
+        final delay = _reconnect.nextDelay();
+        logger.log(
+          MqttLogLevel.warning,
+          'Connection failed (${_reconnect.attempt}): $error; '
+          'retrying in ${delay.inMilliseconds} ms',
+        );
+        await _waitForRetry(delay);
+      }
+    }
+  }
+
+  Future<void> _waitForRetry(Duration delay) async {
+    final cancellation = Completer<void>();
+    _retryCancellation = cancellation;
+    try {
+      await Future.any<void>([
+        Future<void>.delayed(delay),
+        cancellation.future,
+      ]);
+    } finally {
+      if (identical(_retryCancellation, cancellation)) {
+        _retryCancellation = null;
+      }
     }
   }
 
@@ -244,14 +297,19 @@ final class ConnectionManager {
     if (rethrowToCaller) {
       Error.throwWithStackTrace(error, stackTrace);
     }
-    logger.log(MqttLogLevel.error, 'Connection ended: $error');
-    final handler = onFatalError;
-    if (handler != null) {
-      handler(error, stackTrace);
-    }
+    _reportFatal(error, stackTrace);
   }
 
   bool _isFatal(Object error) {
+    // TLS handshake failures are normally configuration, certificate or peer
+    // trust failures. Retrying the same credentials forever cannot repair
+    // them; surface the failure so the owner can refresh credentials.
+    if (error is TlsException) {
+      return true;
+    }
+    if (error is MqttProtocolException) {
+      return true;
+    }
     if (error is MqttServerMovedException ||
         error is MqttAuthenticationException) {
       return true;
@@ -266,45 +324,64 @@ final class ConnectionManager {
 
   Future<void> _attemptConnect() async {
     final transport = transportFactory();
-    await transport.connect();
-    _transport = transport;
-    _decoder = MqttPacketDecoder(maximumPacketSize: clientMaximumPacketSize);
-    _incomingSub = transport.incoming.listen(
-      _onData,
-      onError: (Object error) => _onTransportError(error),
-    );
-
-    final builder = _connectPacketBuilder;
-    if (builder == null) {
-      throw MqttConnectionException('No CONNECT packet configured');
+    try {
+      await transport.connect();
+    } on Object {
+      await _closeTransport(transport);
+      rethrow;
     }
-    final connectPacket = builder();
+    if (!_running) {
+      await _closeTransport(transport);
+      throw MqttConnectionException('Connection stopped');
+    }
+    _transport = transport;
+    try {
+      _decoder = MqttPacketDecoder(maximumPacketSize: clientMaximumPacketSize);
+      _incomingSub =
+          transport.incoming.listen(_onData, onError: _onTransportError);
 
-    _connackCompleter = Completer<MqttConnackPacket>();
+      final builder = _connectPacketBuilder;
+      if (builder == null) {
+        throw MqttConnectionException('No CONNECT packet configured');
+      }
+      final connectPacket = builder();
+
+      _write(connectPacket);
+      var connack = await _waitForConnack();
+      _lastConnack = connack;
+
+      while (connack.reasonCode == MqttReasonCode.continueAuthentication) {
+        _setState(MqttConnectionState.authenticating);
+        await _continueAuthentication(connack, connectPacket);
+        connack = await _waitForConnack();
+        _lastConnack = connack;
+      }
+
+      _failOnRejection(connack);
+
+      _keepAlive.start(Duration(seconds: connectPacket.keepAliveSeconds));
+      for (final property in connack.properties) {
+        if (property is ServerKeepAlive) {
+          _keepAlive.updateKeepAlive(Duration(seconds: property.seconds));
+        }
+      }
+    } on Object {
+      await _teardownTransport();
+      rethrow;
+    }
+  }
+
+  Future<MqttConnackPacket> _waitForConnack() async {
+    final completer = Completer<MqttConnackPacket>();
+    _connackCompleter = completer;
     _connackTimer = Timer(connackTimeout, _onConnackTimeout);
-    _write(connectPacket);
-    var connack = await _connackCompleter!.future;
-    _connackTimer?.cancel();
-    _connackTimer = null;
-    _lastConnack = connack;
-
-    while (connack.reasonCode == MqttReasonCode.continueAuthentication) {
-      _setState(MqttConnectionState.authenticating);
-      await _continueAuthentication(connack, connectPacket);
-      _connackCompleter = Completer<MqttConnackPacket>();
-      _connackTimer = Timer(connackTimeout, _onConnackTimeout);
-      connack = await _connackCompleter!.future;
+    try {
+      return await completer.future;
+    } finally {
       _connackTimer?.cancel();
       _connackTimer = null;
-      _lastConnack = connack;
-    }
-
-    _failOnRejection(connack);
-
-    _keepAlive.start(Duration(seconds: connectPacket.keepAliveSeconds));
-    for (final property in connack.properties) {
-      if (property is ServerKeepAlive) {
-        _keepAlive.updateKeepAlive(Duration(seconds: property.seconds));
+      if (identical(_connackCompleter, completer)) {
+        _connackCompleter = null;
       }
     }
   }
@@ -419,7 +496,13 @@ final class ConnectionManager {
       // Letting it escape would take down the enclosing zone.
       metrics.protocolErrorCount++;
       logger.log(MqttLogLevel.error, 'Protocol error, closing connection: $e');
-      unawaited(_handleConnectionLoss(disconnectReason: _disconnectReasonFor(e)));
+      unawaited(
+        _startConnectionLoss(
+          error: e,
+          stackTrace: StackTrace.current,
+          disconnectReason: _disconnectReasonFor(e),
+        ),
+      );
     }
   }
 
@@ -437,30 +520,61 @@ final class ConnectionManager {
   ///
   /// The teardown is awaited before reconnecting so a new transport cannot be
   /// installed while the old one is still being released.
-  Future<void> _handleConnectionLoss({MqttReasonCode? disconnectReason}) async {
-    if (!_running) {
-      return;
+  Future<void> _startConnectionLoss({
+    required Object error,
+    required StackTrace stackTrace,
+    MqttReasonCode? disconnectReason,
+  }) {
+    final active = _activeConnectionLoss;
+    if (active != null) {
+      return active;
     }
-    if (disconnectReason != null) {
-      // Best effort: tell the broker why we are going away (section 4.13).
-      try {
-        _write(MqttDisconnectPacket(reasonCode: disconnectReason));
-      } on Object {
-        // The connection is already gone; nothing to report.
+    final loss = _handleConnectionLoss(
+      error: error,
+      stackTrace: stackTrace,
+      disconnectReason: disconnectReason,
+    );
+    _activeConnectionLoss = loss;
+    return loss;
+  }
+
+  Future<void> _handleConnectionLoss({
+    required Object error,
+    required StackTrace stackTrace,
+    MqttReasonCode? disconnectReason,
+  }) async {
+    var reconnect = false;
+    try {
+      if (!_running) {
+        return;
       }
+      if (disconnectReason != null) {
+        // Best effort: tell the broker why we are going away (section 4.13).
+        try {
+          _write(MqttDisconnectPacket(reasonCode: disconnectReason));
+        } on Object {
+          // The connection is already gone; nothing to report.
+        }
+      }
+      _keepAlive.stop();
+      await _teardownTransport();
+      onConnectionLost();
+      if (!_running) {
+        return;
+      }
+      if (!autoReconnect) {
+        _running = false;
+        _setState(MqttConnectionState.disconnected);
+        _reportFatal(error, stackTrace);
+        return;
+      }
+      reconnect = true;
+    } finally {
+      _activeConnectionLoss = null;
     }
-    _keepAlive.stop();
-    await _teardownTransport();
-    onConnectionLost();
-    if (!_running) {
-      return;
+    if (reconnect && _running) {
+      await _startRun(initial: false);
     }
-    if (!autoReconnect) {
-      _running = false;
-      _setState(MqttConnectionState.disconnected);
-      return;
-    }
-    await _run();
   }
 
   Future<void> _handleReAuth(MqttAuthPacket auth) async {
@@ -516,12 +630,19 @@ final class ConnectionManager {
     return false;
   }
 
-  void _onTransportError(Object error) {
+  void _onTransportError(Object error, StackTrace stackTrace) {
     if (!_running) {
       return;
     }
     logger.log(MqttLogLevel.warning, 'Transport error: $error');
-    unawaited(_handleConnectionLoss());
+    final connackCompleter = _connackCompleter;
+    if (connackCompleter != null && !connackCompleter.isCompleted) {
+      connackCompleter.completeError(error, stackTrace);
+      return;
+    }
+    unawaited(
+      _startConnectionLoss(error: error, stackTrace: stackTrace),
+    );
   }
 
   /// Handles a DISCONNECT sent by the broker (specification section 3.14).
@@ -548,7 +669,12 @@ final class ConnectionManager {
       onConnectionLost();
       return;
     }
-    await _handleConnectionLoss();
+    await _startConnectionLoss(
+      error: MqttConnectionException(
+        'Broker closed the connection: ${reasonCode?.name ?? 'no reason'}',
+      ),
+      stackTrace: StackTrace.current,
+    );
   }
 
   /// Reason codes after which reconnecting to the same server is pointless.
@@ -580,17 +706,43 @@ final class ConnectionManager {
     if (!_running) {
       return;
     }
-    unawaited(_handleConnectionLoss());
+    unawaited(
+      _startConnectionLoss(
+        error: MqttConnectionException('Keep alive timeout'),
+        stackTrace: StackTrace.current,
+      ),
+    );
   }
 
   Future<void> _teardownTransport() async {
-    await _incomingSub?.cancel();
+    final incomingSub = _incomingSub;
     _incomingSub = null;
     final transport = _transport;
     _transport = null;
-    if (transport != null) {
-      await transport.close();
+    if (incomingSub != null) {
+      try {
+        await incomingSub.cancel();
+      } on Exception catch (error) {
+        logger.log(
+            MqttLogLevel.warning, 'Transport listener cancel failed: $error');
+      }
     }
+    if (transport != null) {
+      await _closeTransport(transport);
+    }
+  }
+
+  Future<void> _closeTransport(MqttTransport transport) async {
+    try {
+      await transport.close();
+    } on Exception catch (error) {
+      logger.log(MqttLogLevel.warning, 'Transport close failed: $error');
+    }
+  }
+
+  void _reportFatal(Object error, StackTrace stackTrace) {
+    logger.log(MqttLogLevel.error, 'Connection ended: $error');
+    onFatalError?.call(error, stackTrace);
   }
 
   void _setState(MqttConnectionState state) {

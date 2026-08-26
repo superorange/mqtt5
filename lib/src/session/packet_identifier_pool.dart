@@ -71,5 +71,10 @@ final class PacketIdentifierPool {
   void reset() {
     _inUse.clear();
     _next = 1;
+    final signal = _releaseSignal;
+    _releaseSignal = null;
+    if (signal != null && !signal.isCompleted) {
+      signal.complete();
+    }
   }
 }

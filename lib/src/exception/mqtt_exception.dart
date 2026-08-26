@@ -6,7 +6,10 @@ class MqttException implements Exception {
   final Object? cause;
 
   @override
-  String toString() => 'MqttException: $message';
+  String toString() {
+    final cause = this.cause;
+    return '$runtimeType: $message${cause == null ? '' : ' (cause: $cause)'}';
+  }
 }
 
 /// A violation of the MQTT protocol (on the wire level).
@@ -42,7 +45,8 @@ class MqttAuthenticationException extends MqttException {
 /// The server asked the client to connect to another server, or reported that
 /// it has moved.
 class MqttServerMovedException extends MqttException {
-  MqttServerMovedException(this.reasonCode, this.serverReference, [Object? cause])
+  MqttServerMovedException(this.reasonCode, this.serverReference,
+      [Object? cause])
       : super(
           'Server requested connection to another server: $serverReference',
           cause,

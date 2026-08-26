@@ -60,6 +60,23 @@ final class MqttClient {
     this.autoReconnect = true,
     this.operationTimeout = const Duration(seconds: 30),
   }) : clientId = clientId ?? _generateClientId() {
+    if (port < 1 || port > 0xFFFF) {
+      throw ArgumentError.value(port, 'port', 'Must be between 1 and 65535');
+    }
+    if (connectionTimeout <= Duration.zero) {
+      throw ArgumentError.value(
+        connectionTimeout,
+        'connectionTimeout',
+        'Must be greater than zero',
+      );
+    }
+    if (operationTimeout < Duration.zero) {
+      throw ArgumentError.value(
+        operationTimeout,
+        'operationTimeout',
+        'Must not be negative',
+      );
+    }
     _connectionManager = ConnectionManager(
       transportFactory: _createTransport,
       onPacket: _onPacket,
@@ -108,8 +125,7 @@ final class MqttClient {
   // unwind into the socket event handler and be mistaken for a peer error.
   final StreamController<MqttMessage> _messages =
       StreamController<MqttMessage>.broadcast();
-  final StreamController<Object> _errors =
-      StreamController<Object>.broadcast();
+  final StreamController<Object> _errors = StreamController<Object>.broadcast();
 
   final MqttSession _session = MqttSession();
   final Map<int, Completer<MqttSubackPacket>> _pendingSubscribes = {};
@@ -183,11 +199,55 @@ final class MqttClient {
     if (_closed) {
       throw MqttConnectionException('Client has been closed');
     }
-    if (keepAlive.inSeconds > 0xFFFF) {
+    if (keepAlive < Duration.zero || keepAlive.inSeconds > 0xFFFF) {
       throw ArgumentError.value(
         keepAlive,
         'keepAlive',
-        'Keep Alive must not exceed 65535 seconds (18h12m15s)',
+        'Must be between zero and 65535 seconds (18h12m15s)',
+      );
+    }
+    if (receiveMaximum < 1 || receiveMaximum > 0xFFFF) {
+      throw ArgumentError.value(
+        receiveMaximum,
+        'receiveMaximum',
+        'Must be between 1 and 65535',
+      );
+    }
+    if (maximumPacketSize < 1 || maximumPacketSize > 0xFFFFFFFF) {
+      throw ArgumentError.value(
+        maximumPacketSize,
+        'maximumPacketSize',
+        'Must be between 1 and 4294967295',
+      );
+    }
+    if (topicAliasMaximum < 0 || topicAliasMaximum > 0xFFFF) {
+      throw ArgumentError.value(
+        topicAliasMaximum,
+        'topicAliasMaximum',
+        'Must be between 0 and 65535',
+      );
+    }
+    final expiry = sessionExpiryInterval;
+    if (expiry != null &&
+        (expiry < Duration.zero || expiry.inSeconds > 0xFFFFFFFF)) {
+      throw ArgumentError.value(
+        expiry,
+        'sessionExpiryInterval',
+        'Must be between zero and 4294967295 seconds',
+      );
+    }
+    if (authenticationData != null && authenticationMethod == null) {
+      throw ArgumentError.value(
+        authenticationData,
+        'authenticationData',
+        'Requires authenticationMethod',
+      );
+    }
+    if (authenticationData != null && authenticationData.length > 0xFFFF) {
+      throw ArgumentError.value(
+        authenticationData,
+        'authenticationData',
+        'Must not exceed 65535 bytes',
       );
     }
     _cleanStart = cleanStart;
@@ -257,8 +317,8 @@ final class MqttClient {
 
   /// Fails every operation waiting for a broker acknowledgement.
   void _abortPending(Object error) {
-    _failPending(_pendingSubscribes);
-    _failPending(_pendingUnsubscribes);
+    _failPending(_pendingSubscribes, error);
+    _failPending(_pendingUnsubscribes, error);
     for (final entry in _session.outgoingQos1.entries.toList()) {
       if (!entry.completer.isCompleted) {
         entry.completer.completeError(error);
@@ -454,9 +514,11 @@ final class MqttClient {
         aliased.commit();
         return const MqttPublishResult();
       case MqttQos.atLeastOnce:
-        return _publishQos1(topic, payload, retain: retain, properties: properties);
+        return _publishQos1(topic, payload,
+            retain: retain, properties: properties);
       case MqttQos.exactlyOnce:
-        return _publishQos2(topic, payload, retain: retain, properties: properties);
+        return _publishQos2(topic, payload,
+            retain: retain, properties: properties);
     }
   }
 
@@ -609,7 +671,8 @@ final class MqttClient {
       case MqttSubackPacket suback:
         _completePending(_pendingSubscribes, suback.packetIdentifier, suback);
       case MqttUnsubackPacket unsuback:
-        _completePending(_pendingUnsubscribes, unsuback.packetIdentifier, unsuback);
+        _completePending(
+            _pendingUnsubscribes, unsuback.packetIdentifier, unsuback);
       case MqttPubackPacket puback:
         _handlePuback(puback);
       case MqttPubrecPacket pubrec:
@@ -734,7 +797,8 @@ final class MqttClient {
       _session.outgoingQos2.remove(pubrec.packetIdentifier);
       _flow.release();
       entry.completer.complete(
-        MqttPublishResult(reasonCode: reasonCode, properties: pubrec.properties),
+        MqttPublishResult(
+            reasonCode: reasonCode, properties: pubrec.properties),
       );
       return;
     }
@@ -751,8 +815,7 @@ final class MqttClient {
     _connectionManager.send(
       MqttPubcompPacket(
         packetIdentifier: pubrel.packetIdentifier,
-        reasonCode:
-            known ? null : MqttReasonCode.packetIdentifierNotFound,
+        reasonCode: known ? null : MqttReasonCode.packetIdentifierNotFound,
       ),
     );
   }
@@ -966,12 +1029,17 @@ final class MqttClient {
     }
   }
 
-  void _failPending<T>(Map<int, Completer<T>> pending) {
+  void _failPending<T>(
+    Map<int, Completer<T>> pending, [
+    Object? error,
+  ]) {
     final completers = pending.values.toList();
     pending.clear();
     for (final completer in completers) {
       if (!completer.isCompleted) {
-        completer.completeError(MqttConnectionException('Connection lost'));
+        completer.completeError(
+          error ?? MqttConnectionException('Connection lost'),
+        );
       }
     }
   }
