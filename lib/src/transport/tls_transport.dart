@@ -18,16 +18,54 @@ final class TlsTransport extends MqttSocketTransport {
   final bool Function(X509Certificate certificate)? onBadCertificate;
   final List<String>? supportedProtocols;
 
+  /// Connects and completes the TLS handshake within [timeout].
+  ///
+  /// [SecureSocket.connect] applies its `timeout` to the TCP connect only: the
+  /// handshake that follows is unbounded, so a peer that accepts the socket and
+  /// then stalls after ClientHello would hang the caller forever. Connecting
+  /// and securing in two steps puts both legs under one deadline, and lets the
+  /// source address actually take effect — `SecureSocket.connect` has no
+  /// parameter for it, so the base class field was silently ignored.
   @override
-  Future<Socket> openSocket() {
-    return SecureSocket.connect(
+  Future<Socket> openSocket() async {
+    final deadline = DateTime.now().add(timeout);
+    final source = sourceAddress;
+    final socket = await Socket.connect(
       host,
       port,
-      context: securityContext,
       timeout: timeout,
-      onBadCertificate: onBadCertificate,
-      supportedProtocols: supportedProtocols,
+      sourceAddress: source != null ? InternetAddress(source) : null,
     );
+
+    final remaining = deadline.difference(DateTime.now());
+    if (remaining <= Duration.zero) {
+      socket.destroy();
+      throw SocketException(
+        'TLS handshake timed out after ${timeout.inMilliseconds} ms',
+        address: socket.remoteAddress,
+        port: port,
+      );
+    }
+
+    try {
+      return await SecureSocket.secure(
+        socket,
+        host: host,
+        context: securityContext,
+        onBadCertificate: onBadCertificate,
+        supportedProtocols: supportedProtocols,
+      ).timeout(remaining, onTimeout: () {
+        // The handshake is abandoned; drop the socket so the fd is not leaked.
+        socket.destroy();
+        throw SocketException(
+          'TLS handshake timed out after ${timeout.inMilliseconds} ms',
+          port: port,
+        );
+      });
+    } on Object {
+      socket.destroy();
+      rethrow;
+    }
   }
 
   /// Builds a [SecurityContext] from PEM-encoded material.

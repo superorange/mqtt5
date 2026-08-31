@@ -28,14 +28,29 @@ final class PacketIdentifierPool {
   }
 
   /// Allocates an identifier, waiting until one becomes available.
-  Future<int> allocate() async {
+  ///
+  /// When [deadline] passes before one frees up, [MqttTimeoutException] is
+  /// thrown. The wait is abandoned inside the pool rather than by the caller,
+  /// so a timed-out request cannot later be handed an identifier nobody owns.
+  Future<int> allocate({DateTime? deadline}) async {
     while (true) {
       final id = tryAllocate();
       if (id != null) {
         return id;
       }
-      final signal = _releaseSignal ??= Completer<void>();
-      await signal.future;
+      if (deadline != null) {
+        final remaining = deadline.difference(DateTime.now());
+        if (remaining <= Duration.zero) {
+          throw MqttTimeoutException(
+            'Timed out waiting for a free packet identifier',
+          );
+        }
+        final signal = _releaseSignal ??= Completer<void>();
+        await signal.future.timeout(remaining, onTimeout: () {});
+      } else {
+        final signal = _releaseSignal ??= Completer<void>();
+        await signal.future;
+      }
     }
   }
 

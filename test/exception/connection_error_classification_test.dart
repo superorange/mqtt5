@@ -30,6 +30,8 @@ void main() {
       ),
       isFalse,
     );
+    expect(
+        isRetryableMqttConnectionError(StateError('factory failed')), isFalse);
   });
 
   test('classifies temporary connection errors', () {

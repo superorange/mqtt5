@@ -59,6 +59,12 @@ final class MqttPacketDecoder {
       final b = _accumulator.peekByte(1 + i);
       value += (b & 0x7F) * multiplier;
       if ((b & 0x80) == 0) {
+        // MQTT-1.5.5: Remaining Length must be minimally encoded.
+        if (i > 0 && b == 0) {
+          throw MqttMalformedPacketException(
+            'Remaining Length is not minimally encoded',
+          );
+        }
         // Maximum Packet Size covers the whole packet, fixed header included
         // (specification section 3.1.2.11.4).
         final total = 1 + i + 1 + value;

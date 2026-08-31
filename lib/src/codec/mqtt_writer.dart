@@ -13,12 +13,31 @@ final class MqttWriter {
     _builder.addByte(value & 0xFF);
   }
 
+  /// Writes a Two Byte Integer.
+  ///
+  /// Out-of-range values are rejected rather than truncated: a silently
+  /// wrapped length prefix produces a packet the peer cannot parse.
   void writeUint16(int value) {
+    if (value < 0 || value > 0xFFFF) {
+      throw ArgumentError.value(
+        value,
+        'value',
+        'Must be between 0 and 65535 to fit a Two Byte Integer',
+      );
+    }
     _builder.addByte((value >> 8) & 0xFF);
     _builder.addByte(value & 0xFF);
   }
 
+  /// Writes a Four Byte Integer, rejecting out-of-range values.
   void writeUint32(int value) {
+    if (value < 0 || value > 0xFFFFFFFF) {
+      throw ArgumentError.value(
+        value,
+        'value',
+        'Must be between 0 and 4294967295 to fit a Four Byte Integer',
+      );
+    }
     _builder.addByte((value >> 24) & 0xFF);
     _builder.addByte((value >> 16) & 0xFF);
     _builder.addByte((value >> 8) & 0xFF);

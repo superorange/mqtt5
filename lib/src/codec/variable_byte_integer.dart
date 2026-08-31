@@ -57,6 +57,14 @@ abstract final class VariableByteInteger {
       final b = reader.readByte();
       value += (b & 0x7F) * multiplier;
       if ((b & 0x80) == 0) {
+        // MQTT-1.5.5: the encoding must use the fewest possible bytes, so a
+        // continuation byte followed by a zero terminator (0x80 0x00) is
+        // malformed even though it decodes to a representable value.
+        if (i > 0 && b == 0) {
+          throw MqttMalformedPacketException(
+            'Variable Byte Integer is not minimally encoded',
+          );
+        }
         return value;
       }
       multiplier <<= 7;

@@ -45,7 +45,7 @@ final class MqttSubackPacket extends MqttPacket
   }
 
   static MqttSubackPacket decode(MqttReader reader) {
-    final packetIdentifier = reader.readUint16();
+    final packetIdentifier = readPacketIdentifier(reader);
     final properties = PropertyCodec.decode(
       reader,
       MqttPropertyContext.suback,

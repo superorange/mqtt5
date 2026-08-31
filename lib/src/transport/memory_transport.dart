@@ -1,9 +1,14 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../exception/mqtt_exception.dart';
 import 'mqtt_transport.dart';
 
 /// An in-memory transport used for tests and as the basis for mock brokers.
+///
+/// [close] is a local teardown (the incoming stream is closed with done).
+/// To simulate a peer drop, call [injectError] or [injectDone] — the same
+/// events a real socket surfaces through `onError`.
 final class MemoryTransport implements MqttTransport {
   final StreamController<Uint8List> _incoming =
       StreamController<Uint8List>.broadcast(sync: true);
@@ -44,8 +49,25 @@ final class MemoryTransport implements MqttTransport {
 
   /// Simulates a connection failure by emitting [error] to the incoming
   /// stream, as a real transport would on socket error.
-  void injectError(Object error) {
-    _incoming.addError(error);
+  void injectError(Object error, [StackTrace? stackTrace]) {
+    if (_closed) {
+      return;
+    }
+    _connected = false;
+    _incoming.addError(error, stackTrace ?? StackTrace.current);
+  }
+
+  /// Simulates a clean peer FIN: the socket reports an error rather than
+  /// just closing the stream, matching [MqttSocketTransport].
+  void injectDone() {
+    if (_closed) {
+      return;
+    }
+    _connected = false;
+    _incoming.addError(
+      MqttTransportException('Connection closed by peer'),
+      StackTrace.current,
+    );
   }
 
   @override
@@ -61,6 +83,9 @@ final class MemoryTransport implements MqttTransport {
 
   @override
   void add(Uint8List data) {
+    if (!_connected || _closed) {
+      throw MqttTransportException('Transport is not connected');
+    }
     _outgoing.add(data);
   }
 

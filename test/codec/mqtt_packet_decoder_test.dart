@@ -170,10 +170,19 @@ void main() {
   group('guards', () {
     test('declared size exceeding maximum throws too large', () {
       final decoder = MqttPacketDecoder(maximumPacketSize: 100);
-      // CONNACK declaring remaining length 101 (VBI: 0xE5 0x00)
+      // CONNACK declaring remaining length 101 (VBI: 0x65)
+      expect(
+        () => decoder.feed(Uint8List.fromList([0x20, 0x65])),
+        throwsA(isA<MqttPacketTooLargeException>()),
+      );
+    });
+
+    test('non-minimal Remaining Length is malformed', () {
+      final decoder = MqttPacketDecoder();
+      // 0xE5 0x00 encodes 101 in two bytes; MQTT-1.5.5 requires 0x65.
       expect(
         () => decoder.feed(Uint8List.fromList([0x20, 0xE5, 0x00])),
-        throwsA(isA<MqttPacketTooLargeException>()),
+        throwsA(isA<MqttMalformedPacketException>()),
       );
     });
 

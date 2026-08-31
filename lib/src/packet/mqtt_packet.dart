@@ -1,3 +1,4 @@
+import '../codec/mqtt_reader.dart';
 import '../codec/mqtt_writer.dart';
 import '../exception/mqtt_exception.dart';
 
@@ -69,4 +70,11 @@ void _requirePacketIdentifier(int packetIdentifier) {
 void writePacketIdentifier(MqttWriter writer, int packetIdentifier) {
   _requirePacketIdentifier(packetIdentifier);
   writer.writeUint16(packetIdentifier);
+}
+
+/// Reads a Packet Identifier, rejecting 0 (specification section 2.2.1).
+int readPacketIdentifier(MqttReader reader) {
+  final packetIdentifier = reader.readUint16();
+  _requirePacketIdentifier(packetIdentifier);
+  return packetIdentifier;
 }

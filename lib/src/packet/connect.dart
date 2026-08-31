@@ -48,6 +48,24 @@ final class MqttConnectPacket extends MqttPacket {
         'Must be between 0 and 65535',
       );
     }
+    // Both are written with a Two Byte Integer length prefix, so an oversized
+    // value would otherwise be truncated into a packet no broker can parse.
+    final willPayload = will?.payload;
+    if (willPayload != null && willPayload.length > 0xFFFF) {
+      throw ArgumentError.value(
+        willPayload.length,
+        'will.payload',
+        'Must not exceed 65535 bytes',
+      );
+    }
+    final pwd = password;
+    if (pwd != null && pwd.length > 0xFFFF) {
+      throw ArgumentError.value(
+        pwd.length,
+        'password',
+        'Must not exceed 65535 bytes',
+      );
+    }
   }
 
   final String clientId;

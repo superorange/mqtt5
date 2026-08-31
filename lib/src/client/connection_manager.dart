@@ -47,8 +47,9 @@ final class ConnectionManager {
   final bool autoReconnect;
 
   /// Called when the handshake completes and [MqttConnackPacket] was received
-  /// with a success reason code.
-  final void Function(MqttConnackPacket connack) onConnected;
+  /// with a success reason code. Awaited before the manager exposes
+  /// [MqttConnectionState.connected], so session resume can finish first.
+  final Future<void> Function(MqttConnackPacket connack) onConnected;
 
   /// Called when an established connection is lost unexpectedly.
   final void Function() onConnectionLost;
@@ -92,12 +93,31 @@ final class ConnectionManager {
   Future<void>? _activeRun;
   Future<void>? _activeConnectionLoss;
   Completer<void>? _retryCancellation;
+  bool _handshakeComplete = false;
+  final List<MqttPacket> _deferredPackets = <MqttPacket>[];
+  MqttConnectPacket? _connectPacket;
+
+  /// Packets that arrive in the same TCP segment as CONNACK are held until
+  /// session capabilities are applied. A compliant broker only needs a
+  /// handful; a flood before the session is ready is a protocol error.
+  static const int _maxDeferredPackets = 128;
 
   MqttConnectionState get state => _state;
 
   Stream<MqttConnectionState> get stateStream => _stateController.stream;
 
   KeepAliveManager get keepAlive => _keepAlive;
+
+  /// Lets inbound packets other than the handshake CONNACK be dispatched.
+  ///
+  /// Called after session capabilities are applied and before inflight
+  /// retransmission. Packets that arrived in the same TCP segment as
+  /// CONNACK — including PUBACK/PUBCOMP that free Receive Maximum slots —
+  /// are flushed here so resume cannot deadlock waiting on a deferred ack.
+  void acceptIncomingPackets() {
+    _handshakeComplete = true;
+    _flushDeferredPackets();
+  }
 
   /// Starts the connect/reconnect loop, calling [connectPacketBuilder] for
   /// every (re)connection attempt.
@@ -144,7 +164,7 @@ final class ConnectionManager {
     if (activeRun != null) {
       try {
         await activeRun;
-      } on Exception catch (error) {
+      } on Object catch (error) {
         logger.log(
           MqttLogLevel.debug,
           'Connection loop stopped with an already reported error: $error',
@@ -219,17 +239,21 @@ final class ConnectionManager {
 
   Future<void> _run({required bool initial}) async {
     while (_running) {
-      _setState(_reconnect.attempt == 0
+      _setState(initial && _reconnect.attempt == 0
           ? MqttConnectionState.connecting
           : MqttConnectionState.reconnecting);
       try {
         await _attemptConnect();
         _reconnect.reset();
+        await onConnected(_lastConnack!);
+        _flushDeferredPackets();
         _setState(MqttConnectionState.connected);
-        onConnected(_lastConnack!);
         return;
-      } on Exception catch (error, stackTrace) {
+      } on Object catch (error, stackTrace) {
         if (!_running) {
+          if (initial) {
+            Error.throwWithStackTrace(error, stackTrace);
+          }
           return;
         }
         if (_isFatal(error) || !autoReconnect) {
@@ -242,10 +266,12 @@ final class ConnectionManager {
         }
         await _teardownTransport();
         if (!_running) {
+          if (initial) {
+            Error.throwWithStackTrace(error, stackTrace);
+          }
           return;
         }
         _setState(MqttConnectionState.reconnecting);
-        metrics.reconnectCount++;
         final delay = _reconnect.nextDelay();
         logger.log(
           MqttLogLevel.warning,
@@ -253,6 +279,12 @@ final class ConnectionManager {
           'retrying in ${delay.inMilliseconds} ms',
         );
         await _waitForRetry(delay);
+        if (!_running) {
+          if (initial) {
+            Error.throwWithStackTrace(error, stackTrace);
+          }
+          return;
+        }
       }
     }
   }
@@ -308,6 +340,8 @@ final class ConnectionManager {
       throw MqttConnectionException('Connection stopped');
     }
     _transport = transport;
+    _handshakeComplete = false;
+    _deferredPackets.clear();
     try {
       _decoder = MqttPacketDecoder(maximumPacketSize: clientMaximumPacketSize);
       _incomingSub =
@@ -318,17 +352,11 @@ final class ConnectionManager {
         throw MqttConnectionException('No CONNECT packet configured');
       }
       final connectPacket = builder();
+      _connectPacket = connectPacket;
 
       _write(connectPacket);
-      var connack = await _waitForConnack();
+      final connack = await _waitForConnack();
       _lastConnack = connack;
-
-      while (connack.reasonCode == MqttReasonCode.continueAuthentication) {
-        _setState(MqttConnectionState.authenticating);
-        await _continueAuthentication(connack, connectPacket);
-        connack = await _waitForConnack();
-        _lastConnack = connack;
-      }
 
       _failOnRejection(connack);
 
@@ -359,29 +387,53 @@ final class ConnectionManager {
     }
   }
 
-  Future<void> _continueAuthentication(
-    MqttConnackPacket connack,
-    MqttConnectPacket connectPacket,
-  ) async {
+  Future<void> _respondToHandshakeAuth(MqttAuthPacket auth) async {
+    final completer = _connackCompleter;
+    if (completer == null || completer.isCompleted) {
+      return;
+    }
+    _setState(MqttConnectionState.authenticating);
+    try {
+      await _sendAuthResponse(
+        auth,
+        responseReasonCode: MqttReasonCode.continueAuthentication,
+      );
+    } on Object catch (error, stackTrace) {
+      if (!completer.isCompleted) {
+        completer.completeError(error, stackTrace);
+      }
+    }
+  }
+
+  Future<void> _sendAuthResponse(
+    MqttAuthPacket challenge, {
+    required MqttReasonCode responseReasonCode,
+  }) async {
     final authenticator = this.authenticator;
     if (authenticator == null) {
       throw MqttAuthenticationException(
-        'Server requested continued authentication but no authenticator '
-        'is configured',
+        'Server sent AUTH but no authenticator is configured',
       );
     }
-    final method = _propertyOf<AuthenticationMethod>(connack)?.value ??
-        _propertyOf<AuthenticationMethod>(connectPacket)?.value;
-    final data = _propertyOf<AuthenticationData>(connack)?.data;
+    final method = _propertyOf<AuthenticationMethod>(challenge)?.value ??
+        _propertyOf<AuthenticationMethod>(_connectPacket)?.value;
+    final data = _propertyOf<AuthenticationData>(challenge)?.data;
     final response = await authenticator.authenticate(
       MqttAuthChallenge(method: method, data: data),
     );
     if (response == null) {
+      try {
+        _write(
+          MqttDisconnectPacket(reasonCode: MqttReasonCode.notAuthorized),
+        );
+      } on Object {
+        // Best effort.
+      }
       throw MqttAuthenticationException('Client aborted authentication');
     }
     _write(
       MqttAuthPacket(
-        reasonCode: MqttReasonCode.continueAuthentication,
+        reasonCode: responseReasonCode,
         properties: [
           if (method != null) AuthenticationMethod(method),
           AuthenticationData(response.data),
@@ -407,7 +459,10 @@ final class ConnectionManager {
     }
   }
 
-  T? _propertyOf<T>(MqttPacket packet) {
+  T? _propertyOf<T>(MqttPacket? packet) {
+    if (packet == null) {
+      return null;
+    }
     List<MqttProperty> properties;
     if (packet is MqttConnackPacket) {
       properties = packet.properties;
@@ -447,35 +502,62 @@ final class ConnectionManager {
         if (_handleHandshakePacket(packet)) {
           continue;
         }
-        if (packet is MqttPingrespPacket) {
-          final sentAt = _pingSentAt;
-          if (sentAt != null) {
-            metrics.lastPingRtt = DateTime.now().difference(sentAt);
+        if (!_handshakeComplete) {
+          if (_deferredPackets.length >= _maxDeferredPackets) {
+            throw MqttProtocolException(
+              'Too many packets queued before the session was ready '
+              '(${_deferredPackets.length})',
+            );
           }
-          _keepAlive.onPingResponse();
+          _deferredPackets.add(packet);
           continue;
         }
-        if (packet is MqttAuthPacket) {
-          unawaited(_handleReAuth(packet).catchError((Object e) {
-            logger.log(MqttLogLevel.error, 'Re-authentication failed: $e');
-          }));
-          continue;
-        }
-        onPacket(packet);
+        _dispatchEstablished(packet);
       }
-    } on Object catch (e) {
+    } on Object catch (e, stackTrace) {
       // Anything thrown while decoding or dispatching a packet is a fault of
       // the peer's byte stream, including errors the codec did not classify.
       // Letting it escape would take down the enclosing zone.
       metrics.protocolErrorCount++;
       logger.log(MqttLogLevel.error, 'Protocol error, closing connection: $e');
+      final completer = _connackCompleter;
+      if (completer != null && !completer.isCompleted) {
+        completer.completeError(e, stackTrace);
+        return;
+      }
       unawaited(
         _startConnectionLoss(
           error: e,
-          stackTrace: StackTrace.current,
+          stackTrace: stackTrace,
           disconnectReason: _disconnectReasonFor(e),
         ),
       );
+    }
+  }
+
+  void _dispatchEstablished(MqttPacket packet) {
+    if (packet is MqttPingrespPacket) {
+      final sentAt = _pingSentAt;
+      if (sentAt != null) {
+        metrics.lastPingRtt = DateTime.now().difference(sentAt);
+      }
+      _keepAlive.onPingResponse();
+      return;
+    }
+    if (packet is MqttAuthPacket) {
+      unawaited(_handleReAuth(packet).catchError((Object e) {
+        logger.log(MqttLogLevel.error, 'Re-authentication failed: $e');
+      }));
+      return;
+    }
+    onPacket(packet);
+  }
+
+  void _flushDeferredPackets() {
+    final deferred = List<MqttPacket>.from(_deferredPackets);
+    _deferredPackets.clear();
+    for (final packet in deferred) {
+      _dispatchEstablished(packet);
     }
   }
 
@@ -485,6 +567,9 @@ final class ConnectionManager {
     }
     if (error is MqttPacketTooLargeException) {
       return MqttReasonCode.packetTooLarge;
+    }
+    if (error is MqttReceiveMaximumExceededException) {
+      return MqttReasonCode.receiveMaximumExceeded;
     }
     return MqttReasonCode.protocolError;
   }
@@ -521,6 +606,9 @@ final class ConnectionManager {
       if (!_running) {
         return;
       }
+      if (autoReconnect) {
+        _setState(MqttConnectionState.reconnecting);
+      }
       if (disconnectReason != null) {
         // Best effort: tell the broker why we are going away (section 4.13).
         try {
@@ -546,59 +634,52 @@ final class ConnectionManager {
       _activeConnectionLoss = null;
     }
     if (reconnect && _running) {
+      metrics.reconnectCount++;
       await _startRun(initial: false);
     }
   }
 
   Future<void> _handleReAuth(MqttAuthPacket auth) async {
-    final authenticator = this.authenticator;
-    if (authenticator == null) {
-      logger.log(
-        MqttLogLevel.error,
-        'Server sent AUTH but no authenticator is configured',
-      );
+    if (auth.reasonCode == MqttReasonCode.success) {
       return;
     }
-    if (auth.reasonCode == MqttReasonCode.reAuthenticate) {
-      final method = _propertyOf<AuthenticationMethod>(auth)?.value;
-      final data = _propertyOf<AuthenticationData>(auth)?.data;
-      final response = await authenticator.authenticate(
-        MqttAuthChallenge(method: method, data: data),
-      );
-      if (response == null) {
-        _write(
-          MqttDisconnectPacket(reasonCode: MqttReasonCode.notAuthorized),
-        );
-        return;
-      }
-      _write(
-        MqttAuthPacket(
-          reasonCode: MqttReasonCode.reAuthenticate,
-          properties: [
-            if (method != null) AuthenticationMethod(method),
-            AuthenticationData(response.data),
-          ],
-        ),
-      );
+    final responseCode = auth.reasonCode == MqttReasonCode.reAuthenticate
+        ? MqttReasonCode.reAuthenticate
+        : MqttReasonCode.continueAuthentication;
+    if (auth.reasonCode != MqttReasonCode.reAuthenticate &&
+        auth.reasonCode != MqttReasonCode.continueAuthentication) {
+      return;
+    }
+    try {
+      await _sendAuthResponse(auth, responseReasonCode: responseCode);
+    } on MqttAuthenticationException catch (error, stackTrace) {
+      await _abort(error, stackTrace, rethrowToCaller: false);
     }
   }
 
   bool _handleHandshakePacket(MqttPacket packet) {
     final completer = _connackCompleter;
-    if (completer != null && !completer.isCompleted) {
-      if (packet is MqttConnackPacket) {
-        completer.complete(packet);
-        return true;
-      }
-      if (packet is MqttDisconnectPacket) {
-        completer.completeError(
-          MqttServerRejectedException(
-            packet.reasonCode?.value ?? 0,
-            'Broker sent DISCONNECT during handshake',
-          ),
-        );
-        return true;
-      }
+    if (completer == null || completer.isCompleted) {
+      return false;
+    }
+    if (packet is MqttConnackPacket) {
+      completer.complete(packet);
+      return true;
+    }
+    if (packet is MqttDisconnectPacket) {
+      completer.completeError(
+        MqttServerRejectedException(
+          packet.reasonCode?.value ?? 0,
+          'Broker sent DISCONNECT during handshake',
+        ),
+      );
+      return true;
+    }
+    if (packet is MqttAuthPacket) {
+      unawaited(_respondToHandshakeAuth(packet).catchError((Object e) {
+        logger.log(MqttLogLevel.error, 'Handshake AUTH failed: $e');
+      }));
+      return true;
     }
     return false;
   }
@@ -623,18 +704,27 @@ final class ConnectionManager {
   /// The broker will not accept any further packets on this connection, so
   /// the transport is released immediately instead of waiting for the peer to
   /// close the socket.
-  Future<void> handleServerDisconnect(MqttReasonCode? reasonCode) async {
+  Future<void> handleServerDisconnect(MqttDisconnectPacket disconnect) async {
     if (!_running) {
       return;
     }
+    final reasonCode = disconnect.reasonCode;
+    String? serverReference;
+    for (final property in disconnect.properties) {
+      if (property is ServerReference) {
+        serverReference = property.value;
+      }
+    }
+    final diagnostic = _serverDisconnectDiagnostic(disconnect);
+    logger.log(MqttLogLevel.warning, 'Broker sent DISCONNECT: $diagnostic');
     if (reasonCode != null && _isFatalDisconnectReason(reasonCode)) {
       await _abort(
         reasonCode == MqttReasonCode.useAnotherServer ||
                 reasonCode == MqttReasonCode.serverMoved
-            ? MqttServerMovedException(reasonCode.value, _lastServerReference)
+            ? MqttServerMovedException(reasonCode.value, serverReference)
             : MqttServerRejectedException(
                 reasonCode.value,
-                'Broker closed the connection: ${reasonCode.name}',
+                'Broker closed the connection: $diagnostic',
               ),
         StackTrace.current,
         rethrowToCaller: false,
@@ -644,10 +734,54 @@ final class ConnectionManager {
     }
     await _startConnectionLoss(
       error: MqttConnectionException(
-        'Broker closed the connection: ${reasonCode?.name ?? 'no reason'}',
+        'Broker closed the connection: $diagnostic',
       ),
       stackTrace: StackTrace.current,
     );
+  }
+
+  String _serverDisconnectDiagnostic(MqttDisconnectPacket disconnect) {
+    final reasonCode = disconnect.reasonCode;
+    String? reasonString;
+    String? serverReference;
+    final userProperties = <String>[];
+    for (final property in disconnect.properties) {
+      switch (property) {
+        case ReasonString(:final value):
+          reasonString = _safeDiagnosticValue(value);
+        case ServerReference(:final value):
+          serverReference = _safeDiagnosticValue(value);
+        case UserProperty(:final name, :final value):
+          if (userProperties.length < 8) {
+            userProperties.add(
+              '${_safeDiagnosticValue(name)}=${_safeDiagnosticValue(value)}',
+            );
+          }
+        default:
+          break;
+      }
+    }
+    final value = reasonCode?.value;
+    final code =
+        value == null ? 'none' : '0x${value.toRadixString(16).padLeft(2, '0')}';
+    return '${reasonCode?.name ?? 'noReason'} code=$code'
+        '${reasonString == null ? '' : ' reasonString="$reasonString"'}'
+        '${serverReference == null ? '' : ' serverReference="$serverReference"'}'
+        '${userProperties.isEmpty ? '' : ' userProperties={${userProperties.join(', ')}}'}';
+  }
+
+  String _safeDiagnosticValue(String value) {
+    final buffer = StringBuffer();
+    for (final unit in value.codeUnits) {
+      if (unit >= 0x20 && unit != 0x7F) {
+        buffer.writeCharCode(unit);
+      } else {
+        buffer.write(' ');
+      }
+    }
+    final singleLine = buffer.toString().trim();
+    if (singleLine.length <= 256) return singleLine;
+    return '${singleLine.substring(0, 256)}…';
   }
 
   /// Reason codes after which reconnecting to the same server is pointless.
@@ -659,17 +793,11 @@ final class ConnectionManager {
         reasonCode == MqttReasonCode.badAuthenticationMethod;
   }
 
-  String? _lastServerReference;
-
-  /// Records the Server Reference from the broker's DISCONNECT, so an abort
-  /// triggered by it can carry the redirect target.
-  set serverReference(String? value) => _lastServerReference = value;
-
   void _onPingRequired() {
     try {
       _pingSentAt = DateTime.now();
       _write(const MqttPingreqPacket());
-    } on MqttException catch (e) {
+    } on Object catch (e) {
       logger.log(MqttLogLevel.warning, 'Failed to send PINGREQ: $e');
     }
   }
@@ -688,6 +816,9 @@ final class ConnectionManager {
   }
 
   Future<void> _teardownTransport() async {
+    _handshakeComplete = false;
+    _deferredPackets.clear();
+    _connectPacket = null;
     final incomingSub = _incomingSub;
     _incomingSub = null;
     final transport = _transport;

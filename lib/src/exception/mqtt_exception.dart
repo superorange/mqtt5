@@ -1,11 +1,22 @@
 import 'dart:io';
 
+/// An MQTT failure together with the stack captured where the library first
+/// classified or reported it. [MqttClient.errors] remains available for
+/// backwards compatibility; diagnostics should prefer the structured stream.
+final class MqttErrorEvent {
+  const MqttErrorEvent(this.error, this.stackTrace);
+
+  final Object error;
+  final StackTrace stackTrace;
+}
+
 /// Whether retrying the same MQTT connection settings may make progress.
 ///
 /// Network failures and temporary broker rejections are retryable. TLS,
 /// protocol, authentication and permanent CONNACK rejections are not.
 bool isRetryableMqttConnectionError(Object error) {
-  if (error is TlsException ||
+  if (error is Error ||
+      error is TlsException ||
       error is MqttProtocolException ||
       error is MqttAuthenticationException ||
       error is MqttServerMovedException) {
@@ -48,6 +59,12 @@ class MqttProtocolException extends MqttException {
 /// A packet that cannot be decoded because it violates the wire format.
 class MqttMalformedPacketException extends MqttProtocolException {
   MqttMalformedPacketException(super.message, [super.cause]);
+}
+
+/// The peer sent more unacknowledged QoS 1/2 publications than the Receive
+/// Maximum this client declared in its CONNECT packet.
+class MqttReceiveMaximumExceededException extends MqttProtocolException {
+  MqttReceiveMaximumExceededException(super.message, [super.cause]);
 }
 
 /// A packet larger than the negotiated/configured maximum packet size.

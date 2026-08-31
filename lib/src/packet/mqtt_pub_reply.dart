@@ -46,7 +46,7 @@ PubReplyFields decodePubReplyBody(
   Set<int> allowedCodes,
   MqttPropertyContext context,
 ) {
-  final packetIdentifier = reader.readUint16();
+  final packetIdentifier = readPacketIdentifier(reader);
   MqttReasonCode? reasonCode;
   List<MqttProperty> properties = const [];
   if (reader.hasRemaining) {

@@ -37,7 +37,7 @@ abstract final class PropertyCodec {
           'Property ${meta.name} is not allowed in $context',
         );
       }
-      if (!meta.repeatable && !seen.add(identifier)) {
+      if (!meta.repeatsIn(context) && !seen.add(identifier)) {
         throw MqttProtocolException('Duplicate property: ${meta.name}');
       }
       final value = _readValue(reader, meta.type);
@@ -65,7 +65,7 @@ abstract final class PropertyCodec {
           'Property ${meta.name} is not allowed in $context',
         );
       }
-      if (!meta.repeatable && !seen.add(property.identifier)) {
+      if (!meta.repeatsIn(context) && !seen.add(property.identifier)) {
         throw MqttProtocolException('Duplicate property: ${meta.name}');
       }
       meta.validator?.call(property.wireValue);

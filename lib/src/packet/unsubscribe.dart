@@ -41,7 +41,7 @@ final class MqttUnsubscribePacket extends MqttPacket
   }
 
   static MqttUnsubscribePacket decode(MqttReader reader) {
-    final packetIdentifier = reader.readUint16();
+    final packetIdentifier = readPacketIdentifier(reader);
     final properties = PropertyCodec.decode(
       reader,
       MqttPropertyContext.unsubscribe,

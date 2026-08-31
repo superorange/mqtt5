@@ -42,6 +42,7 @@ final class MqttPropertyMeta {
     required this.type,
     required this.allowedPackets,
     this.repeatable = false,
+    this.singleUseIn = const <MqttPropertyContext>{},
     this.validator,
     required this.create,
   });
@@ -50,7 +51,19 @@ final class MqttPropertyMeta {
   final String name;
   final MqttPropertyType type;
   final Set<MqttPropertyContext> allowedPackets;
+
+  /// Whether the property may appear more than once.
   final bool repeatable;
+
+  /// Contexts that override [repeatable] and permit only a single occurrence.
+  ///
+  /// Subscription Identifier may repeat in a PUBLISH (one per matching
+  /// subscription) but must appear at most once in a SUBSCRIBE.
+  final Set<MqttPropertyContext> singleUseIn;
+
+  /// Whether the property may repeat in [context].
+  bool repeatsIn(MqttPropertyContext context) =>
+      repeatable && !singleUseIn.contains(context);
 
   /// Validates the wire value; throws [MqttProtocolException] on failure.
   final void Function(Object value)? validator;
@@ -487,6 +500,7 @@ Map<int, MqttPropertyMeta> _buildMeta() {
         MqttPropertyContext.subscribe,
       },
       repeatable: true,
+      singleUseIn: {MqttPropertyContext.subscribe},
       validator: _requireNonZero,
       create: (v) => SubscriptionIdentifier(v as int),
     ),

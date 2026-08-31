@@ -9,6 +9,7 @@ import 'package:mqtt5/src/packet/connect.dart';
 import 'package:mqtt5/src/packet/disconnect.dart';
 import 'package:mqtt5/src/packet/mqtt_packet.dart';
 import 'package:mqtt5/src/packet/mqtt_packet_codec.dart';
+import 'package:mqtt5/src/exception/mqtt_exception.dart';
 import 'package:mqtt5/src/packet/mqtt_reason_code.dart';
 import 'package:mqtt5/src/packet/publish.dart';
 import 'package:mqtt5/src/transport/memory_transport.dart';
@@ -23,7 +24,8 @@ void main() {
       transportFactory: () => transport,
     );
 
-    final connectFuture = client.connect(keepAlive: const Duration(seconds: 30));
+    final connectFuture =
+        client.connect(keepAlive: const Duration(seconds: 30));
 
     final connectPacket = await _nextPacket(transport) as MqttConnectPacket;
     expect(connectPacket.clientId, client.clientId);
@@ -122,12 +124,15 @@ void main() {
 
     unawaited(_rejectingBroker(transports, () => ++connectCount, brokerDone));
 
-    unawaited(client.connect());
+    final connecting = client.connect();
     await brokerDone.future.timeout(const Duration(seconds: 5));
     expect(connectCount, greaterThanOrEqualTo(2));
     expect(client.state, MqttConnectionState.reconnecting);
 
+    final failedConnect =
+        expectLater(connecting, throwsA(isA<MqttServerRejectedException>()));
     await client.disconnect();
+    await failedConnect;
   });
 }
 

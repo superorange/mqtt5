@@ -8,7 +8,10 @@ final class ServerCapabilities {
   bool wildcardSubscriptionAvailable = true;
   bool subscriptionIdentifierAvailable = true;
   bool sharedSubscriptionAvailable = true;
-  bool requestResponseInformation = false;
+  /// The Response Information the broker returned in CONNACK, used as the
+  /// prefix for request/response topics. Null unless the client asked for it
+  /// with a Request Response Information property in CONNECT.
+  String? responseInformation;
 
   /// Restores the protocol defaults.
   ///
@@ -24,6 +27,6 @@ final class ServerCapabilities {
     wildcardSubscriptionAvailable = true;
     subscriptionIdentifierAvailable = true;
     sharedSubscriptionAvailable = true;
-    requestResponseInformation = false;
+    responseInformation = null;
   }
 }

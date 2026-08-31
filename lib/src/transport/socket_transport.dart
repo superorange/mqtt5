@@ -19,6 +19,10 @@ abstract class MqttSocketTransport implements MqttTransport {
   final Duration timeout;
   final String? sourceAddress;
 
+  /// How long a graceful [close] may wait for the peer before the socket is
+  /// destroyed outright.
+  static const Duration closeTimeout = Duration(seconds: 2);
+
   Socket? _socket;
   final StreamController<Uint8List> _incoming =
       StreamController<Uint8List>.broadcast(sync: true);
@@ -104,9 +108,18 @@ abstract class MqttSocketTransport implements MqttTransport {
     _socket = null;
     if (socket != null) {
       try {
-        await socket.close();
-      } on IOException {
-        // Best-effort close.
+        // close() only shuts down the write half and waits for the peer; a
+        // half-open link or a NAT that never returns FIN would leave the
+        // descriptor in CLOSE_WAIT indefinitely. Bound the graceful close,
+        // then destroy unconditionally so the socket is always released.
+        await socket.close().timeout(closeTimeout, onTimeout: () => socket);
+      } on Object {
+        // Best-effort close; destroy below is what actually frees the socket.
+      }
+      try {
+        socket.destroy();
+      } on Object {
+        // Already gone.
       }
     }
     await _incoming.close();

@@ -41,12 +41,16 @@ void main() {
 
       final failure = MqttTransportException('connection reset');
       final reported = client.errors.first;
+      final structured = client.errorEvents.first;
       transport.injectError(failure);
 
       expect(
         await reported.timeout(const Duration(milliseconds: 500)),
         same(failure),
       );
+      final event = await structured.timeout(const Duration(milliseconds: 500));
+      expect(event.error, same(failure));
+      expect(event.stackTrace.toString(), isNotEmpty);
       expect(client.state, MqttConnectionState.disconnected);
       await client.close();
     });
@@ -108,8 +112,10 @@ void main() {
 
       final firstConnect = client.connect();
       await _waitFor(() => attempts == 1);
-      await client.disconnect().timeout(const Duration(milliseconds: 500));
-      await firstConnect.timeout(const Duration(milliseconds: 500));
+      final disconnecting =
+          client.disconnect().timeout(const Duration(milliseconds: 500));
+      await expectLater(firstConnect, throwsA(isA<SocketException>()));
+      await disconnecting;
 
       final secondConnect = client.connect();
       await _waitFor(() => attempts == 2);
@@ -178,11 +184,21 @@ void main() {
       final pending = expectLater(
         client.subscribe('a/#'),
         throwsA(
-          isA<MqttServerRejectedException>().having(
-            (error) => error.reasonCode,
-            'reasonCode',
-            MqttReasonCode.notAuthorized.value,
-          ),
+          isA<MqttServerRejectedException>()
+              .having(
+                (error) => error.reasonCode,
+                'reasonCode',
+                MqttReasonCode.notAuthorized.value,
+              )
+              .having(
+                (error) => error.message,
+                'diagnostic message',
+                allOf(
+                  contains('notAuthorized code=0x87'),
+                  contains('reasonString="policy revoked"'),
+                  contains('traceId=abc123'),
+                ),
+              ),
         ),
       );
       await Future<void>.delayed(Duration.zero);
@@ -190,6 +206,10 @@ void main() {
         MqttPacketCodec.encode(
           const MqttDisconnectPacket(
             reasonCode: MqttReasonCode.notAuthorized,
+            properties: [
+              ReasonString('policy revoked'),
+              UserProperty('traceId', 'abc123'),
+            ],
           ),
         ),
       );

@@ -45,8 +45,7 @@ void main() {
       expect(client.state, MqttConnectionState.disconnected);
     });
 
-    test('disconnect fails publishes that are still awaiting an ack',
-        () async {
+    test('disconnect fails publishes that are still awaiting an ack', () async {
       final transport = MemoryTransport();
       final client = MqttClient(host: 'x', transportFactory: () => transport);
       await handshake(client, () => transport);
@@ -233,8 +232,9 @@ void main() {
         client.publish('a/b', Uint8List(0), qos: MqttQos.atLeastOnce),
         throwsA(isA<MqttTimeoutException>()),
       );
-      // The identifier and the flow-control slot must both come back.
-      expect(client.inflightCount, 0);
+      // The PUBLISH is already on the wire, so session state stays until
+      // PUBACK, session discard, or disconnect.
+      expect(client.inflightCount, 1);
     });
 
     test('subscribe fails when the broker never acknowledges', () async {

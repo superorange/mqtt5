@@ -38,8 +38,7 @@ void main() {
 
     transport.inject(
       MqttPacketCodec.encode(
-        MqttConnackPacket(
-          sessionPresent: false,
+        MqttAuthPacket(
           reasonCode: MqttReasonCode.continueAuthentication,
           properties: [
             const AuthenticationMethod('SCRAM'),
@@ -66,6 +65,27 @@ void main() {
     expect(authenticator.calls, 1);
 
     await client.disconnect();
+  });
+
+  test('CONNACK continue-authentication reason is a protocol error', () async {
+    final transport = MemoryTransport();
+    final client = MqttClient(
+      host: 'h',
+      transportFactory: () => transport,
+      autoReconnect: false,
+    );
+
+    final connectFuture = client.connect();
+    await _nextPacket(transport);
+    transport.inject(
+      Uint8List.fromList([0x20, 0x03, 0x00, 0x18, 0x00]),
+    );
+
+    await expectLater(
+      connectFuture,
+      throwsA(isA<MqttProtocolException>()),
+    );
+    expect(client.state, MqttConnectionState.disconnected);
   });
 
   test('fatal CONNACK rejection surfaces without retrying', () async {

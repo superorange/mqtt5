@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import '../exception/mqtt_exception.dart';
+
 /// Enforces the server's Receive Maximum for outgoing QoS 1/2 publications.
 ///
 /// A slot is acquired before a PUBLISH is sent and released when its
@@ -15,10 +17,24 @@ final class FlowController {
   int get outstanding => _outstanding;
 
   /// Acquires a send slot, waiting until one is available.
-  Future<void> acquire() async {
+  ///
+  /// When [deadline] passes first, [MqttTimeoutException] is thrown and no
+  /// slot is taken, so a caller that gives up cannot leak quota.
+  Future<void> acquire({DateTime? deadline}) async {
     while (_outstanding >= receiveMaximum) {
-      final waiter = _waiter ??= Completer<void>();
-      await waiter.future;
+      if (deadline != null) {
+        final remaining = deadline.difference(DateTime.now());
+        if (remaining <= Duration.zero) {
+          throw MqttTimeoutException(
+            'Timed out waiting for a Receive Maximum slot',
+          );
+        }
+        final waiter = _waiter ??= Completer<void>();
+        await waiter.future.timeout(remaining, onTimeout: () {});
+      } else {
+        final waiter = _waiter ??= Completer<void>();
+        await waiter.future;
+      }
     }
     _outstanding++;
   }
