@@ -15,12 +15,13 @@ final class MqttSession {
 
   int get inflightCount => outgoingQos1.count + outgoingQos2.count;
 
-  /// Discards all session state.
-  void reset() {
-    packetIds.reset();
-    outgoingQos1.clear();
-    outgoingQos2.clear();
-    incomingQos2.clear();
-    subscriptions.clear();
-  }
+  int _sequence = 0;
+
+  /// The next publish order number.
+  ///
+  /// QoS 1 and QoS 2 publications live in separate stores, so re-sending them
+  /// store by store would not reproduce the order the application published
+  /// them in. MQTT-4.6.0-1 requires that order, so entries carry a sequence
+  /// and a resumed session re-sends them sorted by it.
+  int nextSequence() => ++_sequence;
 }

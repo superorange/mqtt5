@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -27,6 +28,7 @@ import '../session/outgoing_qos1.dart';
 import '../session/outgoing_qos2.dart';
 import '../session/topic_alias.dart';
 import '../subscription.dart';
+import '../topic.dart';
 import '../transport/mqtt_transport.dart';
 import '../transport/tcp_transport.dart';
 import '../transport/tls_transport.dart';
@@ -60,6 +62,8 @@ final class MqttClient {
     this.transportFactory,
     this.autoReconnect = true,
     this.operationTimeout = const Duration(seconds: 30),
+    this.pingResponseTimeout,
+    this.topicAliasEviction = false,
   })  : logger = _GuardedMqttLogger(logger),
         clientId = clientId ?? _generateClientId() {
     if (port < 1 || port > 0xFFFF) {
@@ -79,6 +83,24 @@ final class MqttClient {
         'Must not be negative',
       );
     }
+    final pingTimeout = pingResponseTimeout;
+    if (pingTimeout != null && pingTimeout <= Duration.zero) {
+      throw ArgumentError.value(
+        pingTimeout,
+        'pingResponseTimeout',
+        'Must be greater than zero',
+      );
+    }
+    final willTopic = will?.topic;
+    if (willTopic != null) {
+      // The Will Topic is a Topic Name (section 3.1.3.3). Rejecting it here
+      // beats being disconnected by the broker on every connect attempt.
+      final problem = MqttTopic.checkName(willTopic);
+      if (problem != null) {
+        throw ArgumentError.value(
+            willTopic, 'will.topic', 'A will topic $problem');
+      }
+    }
     _connectionManager = ConnectionManager(
       transportFactory: _createTransport,
       onPacket: _onPacket,
@@ -86,6 +108,7 @@ final class MqttClient {
       onConnectionLost: _onConnectionLost,
       onFatalError: _onFatalError,
       autoReconnect: autoReconnect,
+      pingResponseTimeout: pingResponseTimeout,
       logger: this.logger,
       reconnectManager: reconnectManager,
     );
@@ -119,6 +142,37 @@ final class MqttClient {
   /// [Duration.zero] disables the timeout and waits indefinitely.
   final Duration operationTimeout;
 
+  /// How long a PINGREQ may go unanswered before the connection is treated as
+  /// lost.
+  ///
+  /// Null, the default, uses the keep alive interval itself. That makes the
+  /// worst case for noticing a silently dropped link **two** intervals: one
+  /// for the idle timer to send the PINGREQ, another for the reply that never
+  /// arrives. At `keepAlive: 60s` that is two minutes; at `keepAlive: 300s` it
+  /// is ten.
+  ///
+  /// Set this to decouple the two. `keepAlive` decides how often an idle
+  /// connection must produce traffic — a floor the broker also enforces, and
+  /// what a battery-powered client wants to keep long. This decides how
+  /// quickly a dead link is noticed:
+  ///
+  /// ```dart
+  /// MqttClient(
+  ///   host: 'broker.example.com',
+  ///   pingResponseTimeout: const Duration(seconds: 10),
+  /// );
+  /// await client.connect(keepAlive: const Duration(minutes: 5));
+  /// ```
+  ///
+  /// Keep it comfortably above the round trip time to the broker: a value
+  /// shorter than a slow network's latency turns ordinary delay into a
+  /// reconnect loop.
+  final Duration? pingResponseTimeout;
+
+  /// Whether to evict the least recently used topic alias when all alias slots
+  /// are occupied. Defaults to false.
+  final bool topicAliasEviction;
+
   /// Overrides transport creation; intended for tests and custom transports.
   final MqttTransport Function()? transportFactory;
 
@@ -132,8 +186,14 @@ final class MqttClient {
       StreamController<MqttErrorEvent>.broadcast();
 
   final MqttSession _session = MqttSession();
-  final Map<int, Completer<MqttSubackPacket>> _pendingSubscribes = {};
+  final Map<int, _PendingSubscribe> _pendingSubscribes = {};
   final Map<int, Completer<MqttUnsubackPacket>> _pendingUnsubscribes = {};
+
+  /// Publications a resumed session still has to re-send, oldest first.
+  ///
+  /// Belongs to the network connection rather than the session: it is rebuilt
+  /// by every resume and dropped when the connection ends.
+  final ListQueue<_ResumeItem> _resumeQueue = ListQueue<_ResumeItem>();
 
   bool _connected = false;
   bool _sessionPresent = false;
@@ -143,7 +203,8 @@ final class MqttClient {
   final ServerCapabilities _capabilities = ServerCapabilities();
   List<MqttProperty> _connackProperties = const [];
   final FlowController _flow = FlowController();
-  final TopicAliasMap _outgoingAliases = TopicAliasMap();
+  late final TopicAliasMap _outgoingAliases =
+      TopicAliasMap(enableEviction: topicAliasEviction);
   final TopicAliasMap _incomingAliases = TopicAliasMap();
   int _clientReceiveMaximum = 65535;
   int _clientMaximumPacketSize = 268435455;
@@ -151,6 +212,9 @@ final class MqttClient {
 
   // Connect settings, retained for reconnect and rebuilds.
   bool _cleanStart = true;
+  bool? _reconnectCleanStart;
+  bool _hasConnectedOnce = false;
+  bool _lastSentCleanStart = true;
   Duration _keepAlive = const Duration(seconds: 60);
   Duration? _sessionExpiryInterval;
   List<MqttProperty> _connectProperties = const [];
@@ -206,9 +270,23 @@ final class MqttClient {
   /// [connect]'s `properties` and the broker chose to answer.
   String? get responseInformation => _capabilities.responseInformation;
 
+  /// A snapshot of the limits and options the broker announced in the most
+  /// recent CONNACK.
+  ///
+  /// Holds the protocol defaults before the first connection. These are
+  /// per-connection values, so read it again after a reconnect rather than
+  /// holding on to the result. The client already enforces them; this is for
+  /// diagnostics and for callers that want to adapt — batching to Receive
+  /// Maximum, for example.
+  ///
+  /// A copy, because the client enforces its limits from the same object and
+  /// a caller editing them would quietly disable those checks.
+  ServerCapabilities get serverCapabilities => _capabilities.copy();
+
   /// Establishes (and maintains) the MQTT connection.
   Future<void> connect({
     bool cleanStart = true,
+    bool? reconnectCleanStart,
     Duration keepAlive = const Duration(seconds: 60),
     Duration? sessionExpiryInterval,
     List<MqttProperty> properties = const [],
@@ -280,6 +358,15 @@ final class MqttClient {
         'Must not exceed 65535 bytes',
       );
     }
+    _rejectDuplicateConnectProperties(
+      properties,
+      sessionExpiryInterval: sessionExpiryInterval,
+      receiveMaximum: receiveMaximum,
+      maximumPacketSize: maximumPacketSize,
+      topicAliasMaximum: topicAliasMaximum,
+      authenticationMethod: authenticationMethod,
+      authenticationData: authenticationData,
+    );
     // Arguments are validated even when the client is already connected, so a
     // caller that passes a bad value is told rather than silently ignored.
     if (state == MqttConnectionState.connected ||
@@ -293,6 +380,8 @@ final class MqttClient {
       return;
     }
     _cleanStart = cleanStart;
+    _reconnectCleanStart = reconnectCleanStart;
+    _hasConnectedOnce = false;
     _keepAlive = keepAlive;
     _sessionExpiryInterval = sessionExpiryInterval;
     _connectProperties = properties;
@@ -315,6 +404,31 @@ final class MqttClient {
     await _connectionManager.start(_buildConnectPacket);
   }
 
+  /// Re-authenticates the live connection (specification section 4.12.1).
+  ///
+  /// Only available when [connect] supplied an `authenticationMethod`
+  /// (MQTT-4.12.0-7) and an [authenticator] is configured. The same method is
+  /// reused; [authenticationData] carries the first round of data when the
+  /// mechanism expects the client to speak first.
+  ///
+  /// Publishing and subscribing continue to work while this is in flight, as
+  /// section 4.12.1 requires. If the broker rejects the exchange the
+  /// connection is closed and this throws.
+  Future<void> reauthenticate({Uint8List? authenticationData}) {
+    _ensureConnected();
+    if (authenticationData != null && authenticationData.length > 0xFFFF) {
+      throw ArgumentError.value(
+        authenticationData,
+        'authenticationData',
+        'Must not exceed 65535 bytes',
+      );
+    }
+    return _connectionManager.reauthenticate(
+      authenticationData: authenticationData,
+      timeout: operationTimeout <= Duration.zero ? null : operationTimeout,
+    );
+  }
+
   /// Sends a DISCONNECT packet and closes the connection.
   ///
   /// Operations still awaiting an acknowledgement are failed with
@@ -323,7 +437,9 @@ final class MqttClient {
     MqttReasonCode reasonCode = MqttReasonCode.success,
     List<MqttProperty> properties = const [],
   }) async {
+    _validateDisconnectProperties(properties);
     _connected = false;
+    _hasConnectedOnce = false;
     _connectionManager.beginDisconnect();
     try {
       _connectionManager.send(
@@ -351,6 +467,7 @@ final class MqttClient {
       return;
     }
     _closed = true;
+    _hasConnectedOnce = false;
     try {
       await disconnect(reasonCode: reasonCode);
     } on Object catch (e) {
@@ -362,6 +479,89 @@ final class MqttClient {
     await _errorEvents.close();
   }
 
+  /// Rejects a CONNECT property that the named [connect] arguments will also
+  /// emit.
+  ///
+  /// Either spelling on its own is supported: [_buildConnectPacket] only emits
+  /// one of these properties when its argument differs from the protocol
+  /// default, so a caller may pass the property directly instead. Supplying
+  /// both is the case that has to be caught. None of them may repeat in a
+  /// property section, so it would otherwise fail deep inside the encoder as a
+  /// wire-level "duplicate property" — reported as a protocol error,
+  /// classified as not retryable, and ending the connection loop over what is
+  /// really a mistake at the call site.
+  static void _rejectDuplicateConnectProperties(
+    List<MqttProperty> properties, {
+    required Duration? sessionExpiryInterval,
+    required int receiveMaximum,
+    required int maximumPacketSize,
+    required int topicAliasMaximum,
+    required String? authenticationMethod,
+    required Uint8List? authenticationData,
+  }) {
+    for (final property in properties) {
+      final String? argument = switch (property) {
+        SessionExpiryInterval() when sessionExpiryInterval != null =>
+          'sessionExpiryInterval',
+        ReceiveMaximum() when receiveMaximum != 65535 => 'receiveMaximum',
+        MaximumPacketSize() when maximumPacketSize != 268435455 =>
+          'maximumPacketSize',
+        TopicAliasMaximum() when topicAliasMaximum != 0 => 'topicAliasMaximum',
+        AuthenticationMethod() when authenticationMethod != null =>
+          'authenticationMethod',
+        AuthenticationData() when authenticationData != null =>
+          'authenticationData',
+        _ => null,
+      };
+      if (argument != null) {
+        throw ArgumentError.value(
+          property,
+          'properties',
+          '${property.propertyName} is already set by the $argument argument; '
+              'supply it one way or the other, not both',
+        );
+      }
+    }
+  }
+
+  /// Rejects a DISCONNECT the broker would answer with a protocol error.
+  ///
+  /// Section 3.14.2.2.2: extending a session that was opened with a Session
+  /// Expiry Interval of zero is a protocol error, and the broker replies with
+  /// DISCONNECT 0x82 rather than honouring it.
+  void _validateDisconnectProperties(List<MqttProperty> properties) {
+    if (_requestedSessionExpirySeconds() > 0) {
+      return;
+    }
+    for (final property in properties) {
+      if (property is SessionExpiryInterval && property.seconds != 0) {
+        throw ArgumentError.value(
+          property.seconds,
+          'properties',
+          'A non-zero Session Expiry Interval cannot be set on DISCONNECT '
+              'when CONNECT requested zero',
+        );
+      }
+    }
+  }
+
+  /// The Session Expiry Interval the last CONNECT actually carried.
+  ///
+  /// It can arrive either as the [connect] parameter or inside its
+  /// `properties`, and the DISCONNECT rule is about what went on the wire.
+  int _requestedSessionExpirySeconds() {
+    final fromParameter = _sessionExpiryInterval;
+    if (fromParameter != null) {
+      return fromParameter.inSeconds;
+    }
+    for (final property in _connectProperties) {
+      if (property is SessionExpiryInterval) {
+        return property.seconds;
+      }
+    }
+    return 0;
+  }
+
   /// Fails every operation waiting for a broker acknowledgement and reclaims
   /// the session slots they held.
   ///
@@ -371,7 +571,7 @@ final class MqttClient {
   /// without it a broker that silently stops acknowledging would grow the
   /// store and the identifier pool without bound.
   void _abortPending(Object error) {
-    _failPending(_pendingSubscribes, error);
+    _failPendingSubscribes(error);
     _failPending(_pendingUnsubscribes, error);
     for (final entry in _session.outgoingQos1.entries.toList()) {
       if (!entry.completer.isCompleted) {
@@ -387,6 +587,7 @@ final class MqttClient {
     }
     _session.outgoingQos1.clear();
     _session.outgoingQos2.clear();
+    _resumeQueue.clear();
     _flow.reset();
   }
 
@@ -455,7 +656,11 @@ final class MqttClient {
     final packetIdentifier =
         await _session.packetIds.allocate(deadline: deadline);
     final completer = Completer<MqttSubackPacket>();
-    _pendingSubscribes[packetIdentifier] = completer;
+    _pendingSubscribes[packetIdentifier] = _PendingSubscribe(
+      completer: completer,
+      subscriptions: subscriptions,
+      subscriptionIdentifier: subscriptionIdentifier,
+    );
     var keepInflight = false;
     try {
       _connectionManager.send(
@@ -475,23 +680,37 @@ final class MqttClient {
           '${subscriptions.length} topic filter(s)',
         );
       }
-      for (var i = 0; i < subscriptions.length; i++) {
-        if (suback.reasonCodes[i] < 0x80) {
-          _session.subscriptions.add(
-            subscriptions[i],
-            subscriptionIdentifier: subscriptionIdentifier,
-          );
-        }
-      }
       _throwIfSubackRejected(suback);
     } on MqttTimeoutException {
+      // A timeout is this client giving up on the answer, not the broker
+      // confirming it will never send one. The identifier only becomes
+      // reusable once its SUBACK arrives (MQTT-2.2.1-4), so it stays reserved
+      // until a late SUBACK retires it or the connection ends and
+      // [_failPendingSubscribes] reclaims everything still outstanding.
       keepInflight = true;
       rethrow;
     } finally {
       if (!keepInflight) {
-        _pendingSubscribes.remove(packetIdentifier);
-        _session.packetIds.release(packetIdentifier);
+        _retirePendingSubscribe(packetIdentifier);
       }
+    }
+  }
+
+  void _retirePendingSubscribe(int packetIdentifier) {
+    if (_pendingSubscribes.remove(packetIdentifier) != null) {
+      _session.packetIds.release(packetIdentifier);
+    }
+  }
+
+  /// Drops a pending operation and returns its packet identifier to the pool.
+  ///
+  /// The identifier is released only when this call is the one that removed
+  /// the entry. The acknowledgement handler may have retired it already, and
+  /// releasing twice can hand an identifier back while a second operation is
+  /// using it (MQTT-2.2.1-4).
+  void _retirePending<T>(Map<int, Completer<T>> pending, int packetIdentifier) {
+    if (pending.remove(packetIdentifier) != null) {
+      _session.packetIds.release(packetIdentifier);
     }
   }
 
@@ -523,14 +742,8 @@ final class MqttClient {
 
   void _validateSubscription(MqttSubscription subscription) {
     final topicFilter = subscription.topicFilter;
-    if (topicFilter.isEmpty) {
-      throw ArgumentError.value(
-        topicFilter,
-        'topicFilter',
-        'A topic filter must not be empty',
-      );
-    }
-    final shared = topicFilter.startsWith(r'$share/');
+    _validateTopicFilter(topicFilter);
+    final shared = MqttTopic.isShared(topicFilter);
     if (shared && !_capabilities.sharedSubscriptionAvailable) {
       throw MqttFlowControlException(
         'Shared subscriptions are not supported by the server',
@@ -544,10 +757,25 @@ final class MqttClient {
         'No Local must not be set on a shared subscription',
       );
     }
-    if ((topicFilter.contains('+') || topicFilter.contains('#')) &&
+    // A ShareName cannot hold a wildcard, so only the filter part matters.
+    final effective = MqttTopic.sharedFilterOf(topicFilter);
+    if ((effective.contains('+') || effective.contains('#')) &&
         !_capabilities.wildcardSubscriptionAvailable) {
       throw MqttFlowControlException(
         'Wildcard subscriptions are not supported by the server',
+      );
+    }
+  }
+
+  /// Rejects topic filters the broker is required to reject (section 4.7.1
+  /// and 4.8.2), for both SUBSCRIBE and UNSUBSCRIBE.
+  void _validateTopicFilter(String topicFilter) {
+    final problem = MqttTopic.checkFilter(topicFilter);
+    if (problem != null) {
+      throw ArgumentError.value(
+        topicFilter,
+        'topicFilter',
+        'A topic filter $problem',
       );
     }
   }
@@ -558,6 +786,9 @@ final class MqttClient {
       return;
     }
     _ensureConnected();
+    for (final topicFilter in topicFilters) {
+      _validateTopicFilter(topicFilter);
+    }
     final deadline = _deadline();
     final packetIdentifier =
         await _session.packetIds.allocate(deadline: deadline);
@@ -592,12 +823,13 @@ final class MqttClient {
         }
       }
     } on MqttTimeoutException {
+      // See the matching note in [subscribeAll]: the identifier stays reserved
+      // until the UNSUBACK arrives or the connection ends.
       keepInflight = true;
       rethrow;
     } finally {
       if (!keepInflight) {
-        _pendingUnsubscribes.remove(packetIdentifier);
-        _session.packetIds.release(packetIdentifier);
+        _retirePending(_pendingUnsubscribes, packetIdentifier);
       }
     }
   }
@@ -653,15 +885,10 @@ final class MqttClient {
   /// Rejects topic names that the broker is required to reject, so the caller
   /// gets a local error instead of being disconnected.
   void _validatePublishTopic(String topic) {
-    if (topic.contains('+') || topic.contains('#')) {
+    final problem = MqttTopic.checkName(topic);
+    if (problem != null) {
       throw ArgumentError.value(
-        topic,
-        'topic',
-        'A publish topic name must not contain wildcards',
-      );
-    }
-    if (topic.isEmpty) {
-      throw ArgumentError.value(topic, 'topic', 'Topic name must not be empty');
+          topic, 'topic', 'A publish topic name $problem');
     }
   }
 
@@ -676,8 +903,34 @@ final class MqttClient {
   /// Stored session entries always keep the original topic/properties so a
   /// retransmit after reconnect uses the full topic name.
   _Aliased _applyOutgoingAlias(String topic, List<MqttProperty> properties) {
-    if (properties.any((p) => p is TopicAlias)) {
-      return _Aliased(topic, properties, null, _outgoingAliases);
+    TopicAlias? supplied;
+    for (final property in properties) {
+      if (property is TopicAlias) {
+        supplied = property;
+        break;
+      }
+    }
+    if (supplied != null) {
+      // MQTT-3.3.2-9: a client must not send a Topic Alias greater than the
+      // Topic Alias Maximum the server returned in CONNACK. The broker answers
+      // one by closing the connection, so fail the call instead.
+      if (supplied.value > _capabilities.topicAliasMaximum) {
+        throw MqttFlowControlException(
+          'Topic alias ${supplied.value} exceeds the server maximum of '
+          '${_capabilities.topicAliasMaximum}',
+        );
+      }
+      // The caller is establishing the mapping by hand, so record it once the
+      // packet carrying the full topic name has been written. Without this the
+      // binding is invisible to the map: every later publish to the same topic
+      // would send the full name again, and [reserve] could hand the very same
+      // alias to a different topic.
+      return _Aliased(
+        topic,
+        properties,
+        (alias: supplied.value, topic: topic),
+        _outgoingAliases,
+      );
     }
     final existing = _outgoingAliases.aliasFor(topic);
     if (existing != null) {
@@ -717,6 +970,7 @@ final class MqttClient {
     }
     final entry = OutgoingQos1Entry(
       packetIdentifier: packetIdentifier,
+      sequence: _session.nextSequence(),
       topic: topic,
       payload: payload,
       retain: retain,
@@ -739,6 +993,8 @@ final class MqttClient {
       aliased.commit();
       return await _awaitAck(entry.completer.future, 'PUBACK', deadline);
     } on MqttTimeoutException {
+      // Kept in the session store so a resumed session retransmits it. The
+      // identifier stays reserved with it; see [subscribeAll].
       keepInflight = true;
       rethrow;
     } catch (_) {
@@ -746,9 +1002,28 @@ final class MqttClient {
       rethrow;
     } finally {
       if (!keepInflight) {
-        _session.outgoingQos1.remove(packetIdentifier);
-        _session.packetIds.release(packetIdentifier);
+        _retireOutgoingQos1(packetIdentifier);
       }
+    }
+  }
+
+  /// Drops a QoS 1 entry and returns its packet identifier to the pool.
+  ///
+  /// Every identifier is released exactly where its entry leaves the store, so
+  /// an acknowledgement and the publish call that is unwinding behind it
+  /// cannot both release it. A double release can hand an identifier back to
+  /// the pool after a waiting caller has already been given it, putting two
+  /// live messages on the same identifier (MQTT-2.2.1-3).
+  void _retireOutgoingQos1(int packetIdentifier) {
+    if (_session.outgoingQos1.remove(packetIdentifier) != null) {
+      _session.packetIds.release(packetIdentifier);
+    }
+  }
+
+  /// The QoS 2 counterpart of [_retireOutgoingQos1].
+  void _retireOutgoingQos2(int packetIdentifier) {
+    if (_session.outgoingQos2.remove(packetIdentifier) != null) {
+      _session.packetIds.release(packetIdentifier);
     }
   }
 
@@ -769,6 +1044,7 @@ final class MqttClient {
     }
     final entry = OutgoingQos2Entry(
       packetIdentifier: packetIdentifier,
+      sequence: _session.nextSequence(),
       topic: topic,
       payload: payload,
       retain: retain,
@@ -791,6 +1067,8 @@ final class MqttClient {
       aliased.commit();
       return await _awaitAck(entry.completer.future, 'PUBCOMP', deadline);
     } on MqttTimeoutException {
+      // Kept in the session store so a resumed session retransmits the PUBLISH
+      // or replays the PUBREL, depending on how far the exchange got.
       keepInflight = true;
       rethrow;
     } catch (_) {
@@ -798,8 +1076,7 @@ final class MqttClient {
       rethrow;
     } finally {
       if (!keepInflight) {
-        _session.outgoingQos2.remove(packetIdentifier);
-        _session.packetIds.release(packetIdentifier);
+        _retireOutgoingQos2(packetIdentifier);
       }
     }
   }
@@ -820,7 +1097,7 @@ final class MqttClient {
       case MqttPublishPacket publish:
         _handlePublish(publish);
       case MqttSubackPacket suback:
-        _completePending(_pendingSubscribes, suback.packetIdentifier, suback);
+        _handleSuback(suback);
       case MqttUnsubackPacket unsuback:
         _completePending(
             _pendingUnsubscribes, unsuback.packetIdentifier, unsuback);
@@ -836,6 +1113,32 @@ final class MqttClient {
         _handleServerDisconnect(disconnect);
       default:
         break;
+    }
+  }
+
+  void _handleSuback(MqttSubackPacket suback) {
+    final pending = _pendingSubscribes.remove(suback.packetIdentifier);
+    if (pending == null) {
+      logger.log(
+        MqttLogLevel.debug,
+        'Ignoring SUBACK for unknown packet identifier ${suback.packetIdentifier}',
+      );
+      return;
+    }
+    _session.packetIds.release(suback.packetIdentifier);
+    final subscriptions = pending.subscriptions;
+    if (suback.reasonCodes.length == subscriptions.length) {
+      for (var i = 0; i < subscriptions.length; i++) {
+        if (suback.reasonCodes[i] < 0x80) {
+          _session.subscriptions.add(
+            subscriptions[i],
+            subscriptionIdentifier: pending.subscriptionIdentifier,
+          );
+        }
+      }
+    }
+    if (!pending.completer.isCompleted) {
+      pending.completer.complete(suback);
     }
   }
 
@@ -865,8 +1168,20 @@ final class MqttClient {
     T value,
   ) {
     final completer = pending.remove(packetIdentifier);
+    if (completer == null) {
+      // An acknowledgement for an identifier this client is not waiting on.
+      // The identifier is deliberately left alone: it may belong to a publish
+      // still in flight, and releasing it here would let a second operation
+      // reuse an identifier that is still on the wire.
+      logger.log(
+        MqttLogLevel.debug,
+        'Ignoring acknowledgement for unknown packet identifier '
+        '$packetIdentifier',
+      );
+      return;
+    }
     _session.packetIds.release(packetIdentifier);
-    if (completer != null && !completer.isCompleted) {
+    if (!completer.isCompleted) {
       completer.complete(value);
     }
   }
@@ -877,6 +1192,17 @@ final class MqttClient {
       case MqttQos.atMostOnce:
         _deliver(publish, topic);
       case MqttQos.atLeastOnce:
+        // Section 4.9 counts QoS 1 and QoS 2 publications this client has not
+        // acknowledged yet. A QoS 1 PUBLISH is acknowledged further down this
+        // same synchronous handler, so no QoS 1 exchange is ever outstanding
+        // when the next one is examined: the QoS 2 exchanges in progress are
+        // the whole of the broker's used quota.
+        if (_unacknowledgedIncoming >= _clientReceiveMaximum) {
+          throw MqttReceiveMaximumExceededException(
+            'Broker sent more than the declared Receive Maximum of '
+            '$_clientReceiveMaximum unacknowledged QoS 1/QoS 2 publications',
+          );
+        }
         _deliver(publish, topic);
         _connectionManager.send(
           MqttPubackPacket(packetIdentifier: publish.packetIdentifier),
@@ -918,14 +1244,20 @@ final class MqttClient {
     return topic;
   }
 
+  /// The broker's used share of the Receive Maximum this client declared.
+  ///
+  /// See the note in [_handlePublish]: only QoS 2 exchanges can still be
+  /// unacknowledged at the point an inbound PUBLISH is examined.
+  int get _unacknowledgedIncoming => _session.incomingQos2.count;
+
   void _handleIncomingQos2(MqttPublishPacket publish, String topic) {
     // A retransmission of an exchange already in progress does not consume a
     // new quota slot, so only count identifiers we have not seen yet.
     if (!_session.incomingQos2.contains(publish.packetIdentifier) &&
-        _session.incomingQos2.count >= _clientReceiveMaximum) {
+        _unacknowledgedIncoming >= _clientReceiveMaximum) {
       throw MqttReceiveMaximumExceededException(
         'Broker sent more than the declared Receive Maximum of '
-        '$_clientReceiveMaximum unacknowledged QoS 2 publications',
+        '$_clientReceiveMaximum unacknowledged QoS 1/QoS 2 publications',
       );
     }
     final isNew = _session.incomingQos2.add(publish.packetIdentifier);
@@ -940,10 +1272,14 @@ final class MqttClient {
   void _handlePuback(MqttPubackPacket puback) {
     final entry = _session.outgoingQos1.remove(puback.packetIdentifier);
     if (entry == null) {
+      // Section 3.6.2.1 notes that a Packet Identifier the receiver does not
+      // know is expected during recovery rather than an error, so an
+      // acknowledgement for one is logged and dropped, not escalated.
+      _unknownAcknowledgement('PUBACK', puback.packetIdentifier);
       return;
     }
-    _flow.release();
     _session.packetIds.release(puback.packetIdentifier);
+    _releaseFlow();
     if (!entry.completer.isCompleted) {
       entry.completer.complete(
         MqttPublishResult(
@@ -957,13 +1293,16 @@ final class MqttClient {
   void _handlePubrec(MqttPubrecPacket pubrec) {
     final entry = _session.outgoingQos2[pubrec.packetIdentifier];
     if (entry == null) {
+      _unknownAcknowledgement('PUBREC', pubrec.packetIdentifier);
       return;
     }
     final reasonCode = pubrec.reasonCode;
     if (reasonCode != null && reasonCode.value >= 0x80) {
+      // MQTT-4.4.0-2: the PUBLISH counts as acknowledged and is not
+      // retransmitted. Section 4.9 replenishes the quota for this case too.
       _session.outgoingQos2.remove(pubrec.packetIdentifier);
-      _flow.release();
       _session.packetIds.release(pubrec.packetIdentifier);
+      _releaseFlow();
       if (!entry.completer.isCompleted) {
         entry.completer.complete(
           MqttPublishResult(
@@ -972,11 +1311,23 @@ final class MqttClient {
       }
       return;
     }
+    // A success PUBREC does not replenish the quota (section 4.9); the
+    // exchange stays outstanding until PUBCOMP.
+    if (entry.state == OutgoingQos2State.publishSent) {
+      entry.pubrecSequence = _session.nextSequence();
+    }
     entry.state = OutgoingQos2State.pubRecReceived;
     _connectionManager.send(
       MqttPubrelPacket(packetIdentifier: pubrec.packetIdentifier),
     );
     entry.state = OutgoingQos2State.pubRelSent;
+  }
+
+  void _unknownAcknowledgement(String what, int packetIdentifier) {
+    logger.log(
+      MqttLogLevel.debug,
+      'Ignoring $what for unknown packet identifier $packetIdentifier',
+    );
   }
 
   void _handlePubrel(MqttPubrelPacket pubrel) {
@@ -993,10 +1344,11 @@ final class MqttClient {
   void _handlePubcomp(MqttPubcompPacket pubcomp) {
     final entry = _session.outgoingQos2.remove(pubcomp.packetIdentifier);
     if (entry == null) {
+      _unknownAcknowledgement('PUBCOMP', pubcomp.packetIdentifier);
       return;
     }
-    _flow.release();
     _session.packetIds.release(pubcomp.packetIdentifier);
+    _releaseFlow();
     if (!entry.completer.isCompleted) {
       entry.completer.complete(
         MqttPublishResult(
@@ -1022,18 +1374,31 @@ final class MqttClient {
   }
 
   Future<void> _onConnected(MqttConnackPacket connack) async {
+    // MQTT-3.2.2-2 requires Session Present to be 0 whenever the client asked
+    // for a clean start, and MQTT-3.2.2-4 requires a client with no session
+    // state to close the connection if it is told one was resumed. Continuing
+    // would leave the two ends disagreeing about which messages and
+    // subscriptions exist.
+    if (_lastSentCleanStart && connack.sessionPresent) {
+      throw MqttProtocolException(
+        'Broker reported Session Present after a Clean Start connection',
+      );
+    }
     _sessionPresent = connack.sessionPresent;
+    _hasConnectedOnce = true;
     _applyServerCapabilities(connack);
     logger.log(
       MqttLogLevel.info,
       'Connected (sessionPresent=${connack.sessionPresent})',
     );
     if (!connack.sessionPresent) {
+      // MQTT-3.2.2-5: a client that has session state and is told there is
+      // none must discard it.
       _discardSession();
     }
     _connectionManager.acceptIncomingPackets();
     if (connack.sessionPresent) {
-      await _resumeSession();
+      _resumeSession();
     }
     _connected = true;
   }
@@ -1069,6 +1434,16 @@ final class MqttClient {
           _capabilities.sharedSubscriptionAvailable = shared.value == 1;
         case ResponseInformation responseInformation:
           _capabilities.responseInformation = responseInformation.value;
+        case SessionExpiryInterval sessionExpiry:
+          // Section 3.2.2.3.2: the broker may grant a shorter lease than the
+          // one asked for. Reported, not adopted — the next CONNECT asks for
+          // the interval the application configured, not for whatever the
+          // busiest moment of this connection allowed.
+          _capabilities.sessionExpiryInterval =
+              Duration(seconds: sessionExpiry.seconds);
+        case ServerKeepAlive serverKeepAlive:
+          _capabilities.serverKeepAlive =
+              Duration(seconds: serverKeepAlive.seconds);
         default:
           break;
       }
@@ -1087,91 +1462,143 @@ final class MqttClient {
     if (wasConnected) {
       logger.log(MqttLogLevel.warning, 'Connection lost');
     }
-    _failPending(_pendingSubscribes);
+    _failPendingSubscribes();
     _failPending(_pendingUnsubscribes);
+    // Both belong to the connection that just ended. A resumed session rebuilds
+    // the queue from the session store; there is nothing to carry over.
+    _resumeQueue.clear();
     _flow.reset();
   }
 
-  /// Resumes the session after the broker reported it was present: retransmit
-  /// unacknowledged PUBLISH packets (DUP=1) and outstanding PUBREL packets.
-  Future<void> _resumeSession() async {
+  /// Re-sends everything a resumed session still owes the broker.
+  ///
+  /// Section 4.4 requires re-sending every unacknowledged PUBLISH with QoS > 0
+  /// and every outstanding PUBREL. Three rules shape how that is done:
+  ///
+  /// * MQTT-3.3.4-8 forbids delaying any packet other than a PUBLISH because
+  ///   the send quota is exhausted, so PUBREL is written straight away and
+  ///   takes no quota. Its PUBCOMP still replenishes the quota, clamped at the
+  ///   initial value exactly as section 4.9 describes.
+  /// * MQTT-4.6.0-1 and MQTT-4.6.0-4 require the original ordering, so the
+  ///   passes are sorted by publish and PUBREC order rather than walked store
+  ///   by store — the two stores on their own cannot reproduce the order the
+  ///   application published in.
+  /// * MQTT-4.9.0-2 forbids sending a PUBLISH once the quota is zero, so the
+  ///   PUBLISH pass takes what quota is free and leaves the rest queued. It
+  ///   must never wait: this runs before the connection is reported as
+  ///   established, and a broker that resumes a session while lowering its
+  ///   Receive Maximum would otherwise wedge the client in `reconnecting`
+  ///   with no bound. [_pumpResume] drains the queue as acknowledgements
+  ///   replenish the quota.
+  void _resumeSession() {
+    // The send quota belongs to the network connection, not to the session
+    // (section 4.9), so it starts full however much is still in flight.
     _flow.reset();
-    final qos1 = _session.outgoingQos1.entries.toList();
-    for (final entry in qos1) {
-      await _retransmitQos1(entry);
-    }
-    final qos2 = _session.outgoingQos2.entries.toList();
-    for (final entry in qos2) {
-      await _retransmitQos2(entry);
-    }
-  }
+    _resumeQueue.clear();
 
-  Future<void> _retransmitQos1(OutgoingQos1Entry entry) async {
-    if (_session.outgoingQos1[entry.packetIdentifier] == null) {
-      return;
-    }
-    await _flow.acquire();
-    if (_session.outgoingQos1[entry.packetIdentifier] == null) {
-      _flow.release();
-      return;
-    }
-    try {
-      entry.duplicate = true;
-      _connectionManager.send(
-        MqttPublishPacket(
-          topicName: entry.topic,
-          payload: entry.payload,
-          qos: MqttQos.atLeastOnce,
-          retain: entry.retain,
-          dup: true,
-          packetIdentifier: entry.packetIdentifier,
-          properties: entry.properties,
-        ),
-      );
-    } on Object catch (e) {
-      _flow.release();
-      logger.log(
-        MqttLogLevel.warning,
-        'Session resume failed to retransmit packet ${entry.packetIdentifier}: $e',
-      );
-    }
-  }
-
-  Future<void> _retransmitQos2(OutgoingQos2Entry entry) async {
-    if (_session.outgoingQos2[entry.packetIdentifier] == null) {
-      return;
-    }
-    await _flow.acquire();
-    if (_session.outgoingQos2[entry.packetIdentifier] == null) {
-      _flow.release();
-      return;
-    }
-    try {
-      if (entry.state == OutgoingQos2State.publishSent) {
-        entry.duplicate = true;
-        _connectionManager.send(
-          MqttPublishPacket(
-            topicName: entry.topic,
-            payload: entry.payload,
-            qos: MqttQos.exactlyOnce,
-            retain: entry.retain,
-            dup: true,
-            packetIdentifier: entry.packetIdentifier,
-            properties: entry.properties,
-          ),
-        );
-      } else {
+    final pubrels = <OutgoingQos2Entry>[
+      for (final entry in _session.outgoingQos2.entries)
+        if (entry.state != OutgoingQos2State.publishSent) entry,
+    ]..sort((a, b) => a.pubrecSequence.compareTo(b.pubrecSequence));
+    for (final entry in pubrels) {
+      try {
         _connectionManager.send(
           MqttPubrelPacket(packetIdentifier: entry.packetIdentifier),
         );
+      } on Object catch (e) {
+        logger.log(
+          MqttLogLevel.warning,
+          'Session resume failed to re-send PUBREL for packet '
+          '${entry.packetIdentifier}: $e',
+        );
       }
-    } on Object catch (e) {
-      _flow.release();
-      logger.log(
-        MqttLogLevel.warning,
-        'Session resume failed to retransmit packet ${entry.packetIdentifier}: $e',
+    }
+
+    final publishes = <_ResumeItem>[
+      for (final entry in _session.outgoingQos1.entries)
+        _ResumeItem(
+            entry.packetIdentifier, entry.sequence, MqttQos.atLeastOnce),
+      for (final entry in _session.outgoingQos2.entries)
+        if (entry.state == OutgoingQos2State.publishSent)
+          _ResumeItem(
+              entry.packetIdentifier, entry.sequence, MqttQos.exactlyOnce),
+    ]..sort((a, b) => a.sequence.compareTo(b.sequence));
+    _resumeQueue.addAll(publishes);
+    _pumpResume();
+  }
+
+  /// Re-sends as many queued publications as the send quota allows.
+  ///
+  /// Called once from [_resumeSession] and again whenever an acknowledgement
+  /// replenishes the quota, so a resume that could not finish in one pass
+  /// continues without blocking anything.
+  void _pumpResume() {
+    while (_resumeQueue.isNotEmpty) {
+      final item = _resumeQueue.first;
+      final qos2 = item.qos == MqttQos.exactlyOnce;
+      final topic = qos2
+          ? _session.outgoingQos2[item.packetIdentifier]?.topic
+          : _session.outgoingQos1[item.packetIdentifier]?.topic;
+      if (topic == null) {
+        // Retired while queued: acknowledged late, timed out into a discard,
+        // or dropped with the session.
+        _resumeQueue.removeFirst();
+        continue;
+      }
+      // MQTT-4.9.0-2: with no quota left, stop. The rest stays queued.
+      if (!_flow.tryAcquire()) {
+        return;
+      }
+      _resumeQueue.removeFirst();
+      try {
+        _connectionManager.send(_resumePublishPacket(item));
+      } on Object catch (e) {
+        _flow.release();
+        logger.log(
+          MqttLogLevel.warning,
+          'Session resume failed to retransmit packet '
+          '${item.packetIdentifier}: $e',
+        );
+        // The transport is gone; the remaining entries stay in the session
+        // store and are re-sent by the next resume.
+        return;
+      }
+    }
+  }
+
+  MqttPublishPacket _resumePublishPacket(_ResumeItem item) {
+    // MQTT-3.3.1-1: a re-delivery of an unacknowledged publication sets DUP.
+    // The stored entry always holds the full topic name and the caller's
+    // original properties, so a retransmit never depends on a topic alias
+    // the new connection has not established.
+    if (item.qos == MqttQos.exactlyOnce) {
+      final entry = _session.outgoingQos2[item.packetIdentifier]!;
+      return MqttPublishPacket(
+        topicName: entry.topic,
+        payload: entry.payload,
+        qos: MqttQos.exactlyOnce,
+        retain: entry.retain,
+        dup: true,
+        packetIdentifier: entry.packetIdentifier,
+        properties: entry.properties,
       );
     }
+    final entry = _session.outgoingQos1[item.packetIdentifier]!;
+    return MqttPublishPacket(
+      topicName: entry.topic,
+      payload: entry.payload,
+      qos: MqttQos.atLeastOnce,
+      retain: entry.retain,
+      dup: true,
+      packetIdentifier: entry.packetIdentifier,
+      properties: entry.properties,
+    );
+  }
+
+  /// Gives a send quota slot back and lets a stalled resume continue.
+  void _releaseFlow() {
+    _flow.release();
+    _pumpResume();
   }
 
   /// Discards the session (fresh session): fails in-flight publishes, resets
@@ -1195,6 +1622,7 @@ final class MqttClient {
     _session.outgoingQos2.clear();
     _session.incomingQos2.clear();
     _session.packetIds.reset();
+    _resumeQueue.clear();
     _flow.reset();
 
     final groups = clearSubscriptions
@@ -1238,7 +1666,12 @@ final class MqttClient {
   }) async {
     final packetIdentifier = await _session.packetIds.allocate();
     final completer = Completer<MqttSubackPacket>();
-    _pendingSubscribes[packetIdentifier] = completer;
+    _pendingSubscribes[packetIdentifier] = _PendingSubscribe(
+      completer: completer,
+      subscriptions: subscriptions,
+      subscriptionIdentifier: subscriptionIdentifier,
+    );
+    var keepInflight = false;
     try {
       _connectionManager.send(
         MqttSubscribePacket(
@@ -1252,11 +1685,36 @@ final class MqttClient {
       );
       final suback = await _awaitAck(completer.future, 'SUBACK');
       _throwIfSubackRejected(suback);
+    } on MqttTimeoutException {
+      // Same rule as [subscribeAll]: giving up on the answer is not the broker
+      // confirming none is coming, and MQTT-2.2.1-4 keeps the identifier in use
+      // until its SUBACK is processed. Releasing it here would let the next
+      // publish reuse an identifier the broker still owes a SUBACK for.
+      keepInflight = true;
+      logger.log(
+        MqttLogLevel.warning,
+        'Re-subscribe timed out; packet identifier $packetIdentifier stays '
+        'reserved until the SUBACK arrives or the connection ends',
+      );
     } on MqttException catch (e) {
       logger.log(MqttLogLevel.warning, 'Re-subscribe failed: $e');
     } finally {
-      _pendingSubscribes.remove(packetIdentifier);
-      _session.packetIds.release(packetIdentifier);
+      if (!keepInflight) {
+        _retirePendingSubscribe(packetIdentifier);
+      }
+    }
+  }
+
+  void _failPendingSubscribes([Object? error]) {
+    final entries = _pendingSubscribes.entries.toList();
+    _pendingSubscribes.clear();
+    for (final entry in entries) {
+      _session.packetIds.release(entry.key);
+      if (!entry.value.completer.isCompleted) {
+        entry.value.completer.completeError(
+          error ?? MqttConnectionException('Connection lost'),
+        );
+      }
     }
   }
 
@@ -1311,10 +1769,27 @@ final class MqttClient {
     return seconds == 0 ? 1 : seconds;
   }
 
+  bool _determineCleanStart() {
+    if (!_hasConnectedOnce) {
+      return _cleanStart;
+    }
+    if (_reconnectCleanStart != null) {
+      return _reconnectCleanStart!;
+    }
+    // When reconnecting, attempt to resume the session if a non-zero expiry
+    // interval was configured (MQTT-3.1.2-4, MQTT-3.1.2-5).
+    if (_requestedSessionExpirySeconds() > 0) {
+      return false;
+    }
+    return _cleanStart;
+  }
+
   MqttConnectPacket _buildConnectPacket() {
+    final cleanStart = _determineCleanStart();
+    _lastSentCleanStart = cleanStart;
     return MqttConnectPacket(
       clientId: effectiveClientId,
-      cleanStart: _cleanStart,
+      cleanStart: cleanStart,
       keepAliveSeconds: _keepAliveSeconds,
       properties: [
         if (_sessionExpiryInterval != null)
@@ -1362,6 +1837,18 @@ final class _GuardedMqttLogger implements MqttLogger {
   }
 }
 
+/// One publication a resumed session still owes the broker.
+///
+/// Holds the identifier rather than the entry so the pump always re-reads the
+/// session store: an entry can be retired while it waits for send quota.
+final class _ResumeItem {
+  const _ResumeItem(this.packetIdentifier, this.sequence, this.qos);
+
+  final int packetIdentifier;
+  final int sequence;
+  final MqttQos qos;
+}
+
 /// The topic name and properties to put on the wire for one publish, plus the
 /// alias binding to record once that publish has actually been written.
 final class _Aliased {
@@ -1380,4 +1867,16 @@ final class _Aliased {
       _aliases.commit(pending.alias, pending.topic);
     }
   }
+}
+
+final class _PendingSubscribe {
+  _PendingSubscribe({
+    required this.completer,
+    required this.subscriptions,
+    this.subscriptionIdentifier,
+  });
+
+  final Completer<MqttSubackPacket> completer;
+  final List<MqttSubscription> subscriptions;
+  final int? subscriptionIdentifier;
 }

@@ -15,6 +15,7 @@ enum OutgoingQos2State {
 final class OutgoingQos2Entry {
   OutgoingQos2Entry({
     required this.packetIdentifier,
+    required this.sequence,
     required this.topic,
     required this.payload,
     required this.retain,
@@ -22,6 +23,11 @@ final class OutgoingQos2Entry {
   });
 
   final int packetIdentifier;
+
+  /// Publish order within the session, used to re-send in the order the
+  /// original PUBLISH packets were sent (MQTT-4.6.0-1).
+  final int sequence;
+
   final String topic;
   final Uint8List payload;
   final bool retain;
@@ -29,8 +35,10 @@ final class OutgoingQos2Entry {
 
   OutgoingQos2State state = OutgoingQos2State.publishSent;
 
-  /// Set once the PUBLISH has been retransmitted with DUP=1.
-  bool duplicate = false;
+  /// Order in which the PUBREC for this exchange arrived, used to replay
+  /// PUBREL packets in that same order (MQTT-4.6.0-4). Zero until PUBREC
+  /// arrives, which is also when [state] leaves [OutgoingQos2State.publishSent].
+  int pubrecSequence = 0;
 
   final Completer<MqttPublishResult> completer = Completer<MqttPublishResult>();
 }
@@ -43,8 +51,6 @@ final class OutgoingQos2Store {
   int get count => _entries.length;
 
   Iterable<OutgoingQos2Entry> get entries => _entries.values;
-
-  bool contains(int packetIdentifier) => _entries.containsKey(packetIdentifier);
 
   OutgoingQos2Entry? operator [](int packetIdentifier) =>
       _entries[packetIdentifier];

@@ -6,13 +6,33 @@ final class KeepAliveManager {
   KeepAliveManager({
     required this.onPingRequired,
     required this.onPingTimeout,
-  });
+    this.pingResponseTimeout,
+  }) {
+    final timeout = pingResponseTimeout;
+    if (timeout != null && timeout <= Duration.zero) {
+      throw ArgumentError.value(
+        timeout,
+        'pingResponseTimeout',
+        'Must be greater than zero',
+      );
+    }
+  }
 
   /// Called when a PINGREQ should be sent.
   final void Function() onPingRequired;
 
-  /// Called when a PINGRESP has not arrived within the keep alive interval.
+  /// Called when a PINGRESP has not arrived in time.
   final void Function() onPingTimeout;
+
+  /// How long to wait for a PINGRESP before declaring the link dead.
+  ///
+  /// Null keeps the keep alive interval itself as the deadline, which means a
+  /// silently dropped link takes two intervals to notice: one for the idle
+  /// timer to fire the PINGREQ, another for the answer that never comes. That
+  /// is fine at 60 seconds and poor at 300, so a client that wants death
+  /// detected on its own schedule sets this instead of shortening keep alive
+  /// (which would also raise the traffic floor).
+  final Duration? pingResponseTimeout;
 
   Timer? _timer;
   Duration _keepAlive = Duration.zero;
@@ -71,9 +91,12 @@ final class KeepAliveManager {
     _schedule();
   }
 
-  void _schedule() {
+  /// The wait that applies once a PINGREQ is outstanding.
+  Duration get effectivePingResponseTimeout => pingResponseTimeout ?? _keepAlive;
+
+  void _schedule([Duration? delay]) {
     _timer?.cancel();
-    _timer = Timer(_keepAlive, _onTick);
+    _timer = Timer(delay ?? _keepAlive, _onTick);
   }
 
   void _onTick() {
@@ -87,6 +110,7 @@ final class KeepAliveManager {
     }
     _pingOutstanding = true;
     onPingRequired();
-    _schedule();
+    // The next tick is the PINGRESP deadline, not another idle period.
+    _schedule(effectivePingResponseTimeout);
   }
 }

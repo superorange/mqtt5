@@ -1,6 +1,10 @@
 /// MQTT 5.0 Reason Codes (specification section 2.4).
 enum MqttReasonCode {
+  /// 0x00. Also spelled "Normal disconnection" in DISCONNECT and
+  /// "Granted QoS 0" in SUBACK.
   success(0x00),
+  grantedQos1(0x01),
+  grantedQos2(0x02),
   disconnectWithWillMessage(0x04),
   noMatchingSubscribers(0x10),
   noSubscriptionExisted(0x11),

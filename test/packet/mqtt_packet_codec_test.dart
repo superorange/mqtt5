@@ -245,7 +245,7 @@ void main() {
           ],
         ),
         MqttPublishPacket(
-          topicName: 'device/+/status',
+          topicName: 'device/u1/status',
           payload: Uint8List.fromList(List.generate(100, (i) => i)),
           qos: MqttQos.exactlyOnce,
           retain: true,

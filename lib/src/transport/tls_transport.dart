@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'socket_transport.dart';
@@ -110,5 +111,8 @@ final class TlsTransport extends MqttSocketTransport {
     return context;
   }
 
-  static List<int> _asBytes(String pem) => pem.codeUnits;
+  /// PEM is ASCII armour, but the surrounding file can carry UTF-8 comments or
+  /// non-ASCII subject lines. [String.codeUnits] would hand those to BoringSSL
+  /// as UTF-16 units, so encode properly instead.
+  static List<int> _asBytes(String pem) => utf8.encode(pem);
 }

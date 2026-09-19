@@ -48,6 +48,16 @@ final class MqttConnackPacket extends MqttPacket {
         'Invalid CONNACK reason code: $reasonCodeValue',
       );
     }
+    // MQTT-3.2.2-6: a server sending a non-zero Reason Code must set Session
+    // Present to 0. The combination claims the connection both failed and
+    // resumed a session, which leaves no coherent state to continue from.
+    if (reasonCode != MqttReasonCode.success && sessionPresent) {
+      throw MqttProtocolException(
+        'CONNACK carries reason code 0x'
+        '${reasonCodeValue.toRadixString(16).padLeft(2, '0')} with Session '
+        'Present set, which must be 0 on a non-zero reason code',
+      );
+    }
     final properties = PropertyCodec.decode(
       reader,
       MqttPropertyContext.connack,

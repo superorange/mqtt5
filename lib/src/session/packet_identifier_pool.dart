@@ -69,8 +69,6 @@ final class PacketIdentifierPool {
     }
   }
 
-  bool isInUse(int identifier) => _inUse.contains(identifier);
-
   /// Releases [identifier], waking any waiter.
   void release(int identifier) {
     if (_inUse.remove(identifier)) {

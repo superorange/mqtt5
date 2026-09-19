@@ -8,10 +8,39 @@ final class ServerCapabilities {
   bool wildcardSubscriptionAvailable = true;
   bool subscriptionIdentifierAvailable = true;
   bool sharedSubscriptionAvailable = true;
+
   /// The Response Information the broker returned in CONNACK, used as the
   /// prefix for request/response topics. Null unless the client asked for it
   /// with a Request Response Information property in CONNECT.
   String? responseInformation;
+
+  /// The Session Expiry Interval the broker granted, when it chose a value
+  /// other than the one requested in CONNECT (section 3.2.2.3.2).
+  ///
+  /// This is reported, not applied: the value in CONNECT is what the client
+  /// asks for, and a later reconnect asks for it again rather than silently
+  /// settling for whatever the busiest moment of the previous connection
+  /// allowed.
+  Duration? sessionExpiryInterval;
+
+  /// The keep alive the broker imposed, when it sent a Server Keep Alive
+  /// property in CONNACK (section 3.2.2.3.4).
+  Duration? serverKeepAlive;
+
+  /// An independent copy, so handing these out cannot reach back into the
+  /// values the client enforces its limits from.
+  ServerCapabilities copy() => ServerCapabilities()
+    ..receiveMaximum = receiveMaximum
+    ..maximumPacketSize = maximumPacketSize
+    ..maximumQos = maximumQos
+    ..retainAvailable = retainAvailable
+    ..topicAliasMaximum = topicAliasMaximum
+    ..wildcardSubscriptionAvailable = wildcardSubscriptionAvailable
+    ..subscriptionIdentifierAvailable = subscriptionIdentifierAvailable
+    ..sharedSubscriptionAvailable = sharedSubscriptionAvailable
+    ..responseInformation = responseInformation
+    ..sessionExpiryInterval = sessionExpiryInterval
+    ..serverKeepAlive = serverKeepAlive;
 
   /// Restores the protocol defaults.
   ///
@@ -28,5 +57,7 @@ final class ServerCapabilities {
     subscriptionIdentifierAvailable = true;
     sharedSubscriptionAvailable = true;
     responseInformation = null;
+    sessionExpiryInterval = null;
+    serverKeepAlive = null;
   }
 }

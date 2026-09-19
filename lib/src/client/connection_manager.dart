@@ -13,6 +13,8 @@ import '../packet/mqtt_packet_codec.dart';
 import '../packet/mqtt_reason_code.dart';
 import '../packet/pingreq.dart';
 import '../packet/pingresp.dart';
+import '../packet/subscribe.dart';
+import '../packet/unsubscribe.dart';
 import '../property/mqtt_property.dart';
 import '../transport/mqtt_transport.dart';
 import 'keep_alive_manager.dart';
@@ -32,6 +34,7 @@ final class ConnectionManager {
     this.onFatalError,
     this.autoReconnect = true,
     this.connackTimeout = const Duration(seconds: 10),
+    this.pingResponseTimeout,
     this.logger = const SilentLogger(),
     ReconnectManager? reconnectManager,
   }) : _reconnect = reconnectManager ?? ReconnectManager();
@@ -56,6 +59,10 @@ final class ConnectionManager {
 
   Duration connackTimeout;
 
+  /// How long a PINGREQ may go unanswered before the connection is declared
+  /// lost. Null falls back to the keep alive interval.
+  final Duration? pingResponseTimeout;
+
   /// The maximum packet size the client may send (from the server CONNACK).
   int maximumPacketSize = 268435455;
 
@@ -79,6 +86,7 @@ final class ConnectionManager {
   late final KeepAliveManager _keepAlive = KeepAliveManager(
     onPingRequired: _onPingRequired,
     onPingTimeout: _onPingTimeout,
+    pingResponseTimeout: pingResponseTimeout,
   );
 
   final StreamController<MqttConnectionState> _stateController =
@@ -97,10 +105,24 @@ final class ConnectionManager {
   final List<MqttPacket> _deferredPackets = <MqttPacket>[];
   MqttConnectPacket? _connectPacket;
 
-  /// Packets that arrive in the same TCP segment as CONNACK are held until
-  /// session capabilities are applied. A compliant broker only needs a
-  /// handful; a flood before the session is ready is a protocol error.
-  static const int _maxDeferredPackets = 128;
+  /// Set while a client-initiated re-authentication is waiting for the
+  /// broker's AUTH 0x00 (section 4.12.1).
+  Completer<void>? _reauthentication;
+
+  /// The budget for packets that arrive before the session is ready.
+  ///
+  /// Counted in bytes, not in packets. CONNACK completes its completer through
+  /// a microtask, so everything after it in the *same* chunk is deferred
+  /// synchronously — and a broker is entitled to put a whole burst there: the
+  /// retained messages for a wildcard subscription, or the backlog of a resumed
+  /// session. A packet-count cap turns those normal bursts into a protocol
+  /// error; only a flood large enough to threaten memory is one.
+  static const int _maxDeferredBytes = 8 * 1024 * 1024;
+
+  /// Bytes received on this connection while the handshake was incomplete.
+  /// An upper bound on what [_deferredPackets] holds, measured at the point
+  /// the bytes arrive so packets never have to be re-encoded to be weighed.
+  int _deferredBytes = 0;
 
   MqttConnectionState get state => _state;
 
@@ -116,6 +138,7 @@ final class ConnectionManager {
   /// are flushed here so resume cannot deadlock waiting on a deferred ack.
   void acceptIncomingPackets() {
     _handshakeComplete = true;
+    _deferredBytes = 0;
     _flushDeferredPackets();
   }
 
@@ -190,11 +213,6 @@ final class ConnectionManager {
     _write(packet);
   }
 
-  /// Flushes outbound transport data.
-  Future<void> flush() async {
-    await _transport?.flush();
-  }
-
   void _write(MqttPacket packet) {
     final transport = _transport;
     if (transport == null) {
@@ -245,8 +263,9 @@ final class ConnectionManager {
       try {
         await _attemptConnect();
         _reconnect.reset();
+        // onConnected calls acceptIncomingPackets, which flushes whatever
+        // arrived in the same segment as the CONNACK.
         await onConnected(_lastConnack!);
-        _flushDeferredPackets();
         _setState(MqttConnectionState.connected);
         return;
       } on Object catch (error, stackTrace) {
@@ -313,6 +332,17 @@ final class ConnectionManager {
   }) async {
     _running = false;
     _keepAlive.stop();
+    if (error is MqttProtocolException ||
+        error is MqttAuthenticationException ||
+        error is MqttTimeoutException) {
+      // Section 4.13 and section 4.12.1: tell the peer why before closing.
+      // Best effort — the socket may already be gone, which is the common case.
+      try {
+        _write(MqttDisconnectPacket(reasonCode: _disconnectReasonFor(error)));
+      } on Object {
+        // Nothing to report: the connection is ending either way.
+      }
+    }
     await _teardownTransport();
     _setState(MqttConnectionState.disconnected);
     if (rethrowToCaller) {
@@ -342,6 +372,7 @@ final class ConnectionManager {
     _transport = transport;
     _handshakeComplete = false;
     _deferredPackets.clear();
+    _deferredBytes = 0;
     try {
       _decoder = MqttPacketDecoder(maximumPacketSize: clientMaximumPacketSize);
       _incomingSub =
@@ -394,10 +425,8 @@ final class ConnectionManager {
     }
     _setState(MqttConnectionState.authenticating);
     try {
-      await _sendAuthResponse(
-        auth,
-        responseReasonCode: MqttReasonCode.continueAuthentication,
-      );
+      _validateServerAuth(auth);
+      await _sendAuthResponse(auth);
     } on Object catch (error, stackTrace) {
       if (!completer.isCompleted) {
         completer.completeError(error, stackTrace);
@@ -405,18 +434,66 @@ final class ConnectionManager {
     }
   }
 
-  Future<void> _sendAuthResponse(
-    MqttAuthPacket challenge, {
-    required MqttReasonCode responseReasonCode,
-  }) async {
+  /// The Authentication Method this connection was opened with, or null when
+  /// enhanced authentication is not in use.
+  String? get _connectAuthenticationMethod =>
+      _propertyOf<AuthenticationMethod>(_connectPacket)?.value;
+
+  /// Checks an AUTH packet the broker sent before acting on it.
+  ///
+  /// MQTT-4.12.0-6 forbids the server sending AUTH at all unless the CONNECT
+  /// carried an Authentication Method, MQTT-4.12.0-5 pins that method for the
+  /// whole connection, and Table 3-11 reserves reason code 0x19 for the
+  /// client. A method the client never agreed to is the case that matters:
+  /// accepting it would let a broker steer the exchange to a weaker mechanism.
+  ///
+  /// An AUTH carrying no Authentication Method at all is tolerated. Section
+  /// 3.15.2.1 explicitly allows a bare `AUTH` with Remaining Length 0 to mean
+  /// success, which MQTT-4.12.0-5 read literally would forbid; rejecting that
+  /// encoding would break brokers that use it without protecting anything.
+  void _validateServerAuth(MqttAuthPacket auth) {
+    final expected = _connectAuthenticationMethod;
+    if (expected == null) {
+      throw MqttProtocolException(
+        'Broker sent AUTH but the CONNECT packet carried no Authentication '
+        'Method',
+      );
+    }
+    final method = _propertyOf<AuthenticationMethod>(auth)?.value;
+    if (method != null && method != expected) {
+      throw MqttProtocolException(
+        'Broker sent AUTH with Authentication Method "$method" instead of the '
+        'agreed "$expected"',
+      );
+    }
+    if (auth.reasonCode == MqttReasonCode.reAuthenticate) {
+      throw MqttProtocolException(
+        'Broker sent AUTH with reason code 0x19, which only a client may send',
+      );
+    }
+  }
+
+  /// Answers a broker AUTH challenge with the next round of authentication
+  /// data.
+  ///
+  /// The reply always carries reason code 0x18 (MQTT-4.12.0-3) and the
+  /// Authentication Method from CONNECT (MQTT-4.12.0-5).
+  Future<void> _sendAuthResponse(MqttAuthPacket challenge) async {
     final authenticator = this.authenticator;
     if (authenticator == null) {
       throw MqttAuthenticationException(
         'Server sent AUTH but no authenticator is configured',
       );
     }
-    final method = _propertyOf<AuthenticationMethod>(challenge)?.value ??
-        _propertyOf<AuthenticationMethod>(_connectPacket)?.value;
+    final method = _connectAuthenticationMethod;
+    if (method == null) {
+      // MQTT-4.12.0-7: without a method in CONNECT the client must not send
+      // AUTH at all. _validateServerAuth rejects the challenge first, so this
+      // only guards against a future caller reaching here another way.
+      throw MqttAuthenticationException(
+        'Cannot send AUTH: the CONNECT packet carried no Authentication Method',
+      );
+    }
     final data = _propertyOf<AuthenticationData>(challenge)?.data;
     final response = await authenticator.authenticate(
       MqttAuthChallenge(method: method, data: data),
@@ -433,13 +510,75 @@ final class ConnectionManager {
     }
     _write(
       MqttAuthPacket(
-        reasonCode: responseReasonCode,
+        reasonCode: MqttReasonCode.continueAuthentication,
         properties: [
-          if (method != null) AuthenticationMethod(method),
+          AuthenticationMethod(method),
           AuthenticationData(response.data),
         ],
       ),
     );
+  }
+
+  /// Starts a client-initiated re-authentication (section 4.12.1).
+  ///
+  /// Sends AUTH with reason code 0x19 and completes when the broker answers
+  /// with AUTH 0x00. Other traffic keeps flowing throughout, as the section
+  /// requires; only the reported state changes.
+  Future<void> reauthenticate({
+    Uint8List? authenticationData,
+    Duration? timeout,
+  }) async {
+    if (_state != MqttConnectionState.connected) {
+      throw MqttConnectionException('Not connected');
+    }
+    final method = _connectAuthenticationMethod;
+    if (method == null) {
+      // MQTT-4.12.0-7.
+      throw MqttAuthenticationException(
+        'Re-authentication requires an authenticationMethod on connect()',
+      );
+    }
+    if (_reauthentication != null) {
+      throw MqttAuthenticationException(
+        'A re-authentication is already in progress',
+      );
+    }
+    final completer = Completer<void>();
+    _reauthentication = completer;
+    _setState(MqttConnectionState.authenticating);
+    try {
+      // MQTT-4.12.1-1: the same Authentication Method as the original.
+      _write(
+        MqttAuthPacket(
+          reasonCode: MqttReasonCode.reAuthenticate,
+          properties: [
+            AuthenticationMethod(method),
+            if (authenticationData != null)
+              AuthenticationData(authenticationData),
+          ],
+        ),
+      );
+      await (timeout == null
+          ? completer.future
+          : completer.future.timeout(
+              timeout,
+              onTimeout: () => throw MqttTimeoutException(
+                'Timed out after ${timeout.inSeconds}s waiting for the '
+                're-authentication to complete',
+              ),
+            ));
+    } on Object catch (error, stackTrace) {
+      // MQTT-4.12.1-2: a failed re-authentication closes the connection.
+      await _abort(error, stackTrace, rethrowToCaller: false);
+      rethrow;
+    } finally {
+      if (identical(_reauthentication, completer)) {
+        _reauthentication = null;
+      }
+      if (_state == MqttConnectionState.authenticating) {
+        _setState(MqttConnectionState.connected);
+      }
+    }
   }
 
   void _failOnRejection(MqttConnackPacket connack) {
@@ -495,6 +634,9 @@ final class ConnectionManager {
       return;
     }
     metrics.bytesReceived += data.length;
+    if (!_handshakeComplete) {
+      _deferredBytes += data.length;
+    }
     try {
       final packets = _decoder.feed(data);
       metrics.packetsReceived += packets.length;
@@ -503,10 +645,10 @@ final class ConnectionManager {
           continue;
         }
         if (!_handshakeComplete) {
-          if (_deferredPackets.length >= _maxDeferredPackets) {
+          if (_deferredBytes > _maxDeferredBytes) {
             throw MqttProtocolException(
-              'Too many packets queued before the session was ready '
-              '(${_deferredPackets.length})',
+              'Broker sent $_deferredBytes bytes before the session was ready, '
+              'over the $_maxDeferredBytes byte limit',
             );
           }
           _deferredPackets.add(packet);
@@ -515,27 +657,51 @@ final class ConnectionManager {
         _dispatchEstablished(packet);
       }
     } on Object catch (e, stackTrace) {
-      // Anything thrown while decoding or dispatching a packet is a fault of
-      // the peer's byte stream, including errors the codec did not classify.
-      // Letting it escape would take down the enclosing zone.
-      metrics.protocolErrorCount++;
-      logger.log(MqttLogLevel.error, 'Protocol error, closing connection: $e');
-      final completer = _connackCompleter;
-      if (completer != null && !completer.isCompleted) {
-        completer.completeError(e, stackTrace);
-        return;
-      }
-      unawaited(
-        _startConnectionLoss(
-          error: e,
-          stackTrace: stackTrace,
-          disconnectReason: _disconnectReasonFor(e),
-        ),
-      );
+      _failConnection(e, stackTrace);
     }
   }
 
+  /// Treats [error] as a fault in the peer's byte stream and ends the
+  /// connection, telling the broker why when there is still a socket to say it
+  /// on (section 4.13). Anything thrown while decoding or dispatching a packet
+  /// lands here, including errors the codec did not classify, because letting
+  /// it escape would take down the enclosing zone.
+  void _failConnection(Object error, StackTrace stackTrace) {
+    metrics.protocolErrorCount++;
+    logger.log(
+        MqttLogLevel.error, 'Protocol error, closing connection: $error');
+    final completer = _connackCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.completeError(error, stackTrace);
+      return;
+    }
+    unawaited(
+      _startConnectionLoss(
+        error: error,
+        stackTrace: stackTrace,
+        disconnectReason: _disconnectReasonFor(error),
+      ),
+    );
+  }
+
+  /// Control packets that only ever travel from client to server (Table 2-1),
+  /// plus CONNACK, which a server sends exactly once and only as the first
+  /// packet of a connection (MQTT-3.2.0-1, MQTT-3.2.0-2). Receiving any of
+  /// them is a protocol error under section 4.13.
+  static bool _isInvalidFromServer(MqttPacket packet) =>
+      packet is MqttConnectPacket ||
+      packet is MqttConnackPacket ||
+      packet is MqttSubscribePacket ||
+      packet is MqttUnsubscribePacket ||
+      packet is MqttPingreqPacket;
+
   void _dispatchEstablished(MqttPacket packet) {
+    if (_isInvalidFromServer(packet)) {
+      throw MqttProtocolException(
+        'Broker sent ${packet.type.name.toUpperCase()}, which a client must '
+        'never receive',
+      );
+    }
     if (packet is MqttPingrespPacket) {
       final sentAt = _pingSentAt;
       if (sentAt != null) {
@@ -557,7 +723,15 @@ final class ConnectionManager {
     final deferred = List<MqttPacket>.from(_deferredPackets);
     _deferredPackets.clear();
     for (final packet in deferred) {
-      _dispatchEstablished(packet);
+      // Guarded separately from [_onData]: this runs from the handshake path,
+      // where an escaping error would be reported as a failed connect attempt
+      // instead of the protocol error it is.
+      try {
+        _dispatchEstablished(packet);
+      } on Object catch (error, stackTrace) {
+        _failConnection(error, stackTrace);
+        return;
+      }
     }
   }
 
@@ -570,6 +744,9 @@ final class ConnectionManager {
     }
     if (error is MqttReceiveMaximumExceededException) {
       return MqttReasonCode.receiveMaximumExceeded;
+    }
+    if (error is MqttAuthenticationException || error is MqttTimeoutException) {
+      return MqttReasonCode.notAuthorized;
     }
     return MqttReasonCode.protocolError;
   }
@@ -640,19 +817,29 @@ final class ConnectionManager {
   }
 
   Future<void> _handleReAuth(MqttAuthPacket auth) async {
-    if (auth.reasonCode == MqttReasonCode.success) {
+    try {
+      _validateServerAuth(auth);
+    } on Object catch (error, stackTrace) {
+      _failConnection(error, stackTrace);
       return;
     }
-    final responseCode = auth.reasonCode == MqttReasonCode.reAuthenticate
-        ? MqttReasonCode.reAuthenticate
-        : MqttReasonCode.continueAuthentication;
-    if (auth.reasonCode != MqttReasonCode.reAuthenticate &&
-        auth.reasonCode != MqttReasonCode.continueAuthentication) {
+    // Section 3.15.2.1: an AUTH with Remaining Length 0 means Success.
+    final reasonCode = auth.reasonCode ?? MqttReasonCode.success;
+    if (reasonCode == MqttReasonCode.success) {
+      final reauthentication = _reauthentication;
+      if (reauthentication != null && !reauthentication.isCompleted) {
+        reauthentication.complete();
+      }
       return;
     }
     try {
-      await _sendAuthResponse(auth, responseReasonCode: responseCode);
+      await _sendAuthResponse(auth);
     } on MqttAuthenticationException catch (error, stackTrace) {
+      final reauthentication = _reauthentication;
+      if (reauthentication != null && !reauthentication.isCompleted) {
+        reauthentication.completeError(error, stackTrace);
+      }
+      // MQTT-4.12.1-2: a failed re-authentication closes the connection.
       await _abort(error, stackTrace, rethrowToCaller: false);
     }
   }
@@ -681,7 +868,13 @@ final class ConnectionManager {
       }));
       return true;
     }
-    return false;
+    // MQTT-3.2.0-1: the first packet the server sends on a connection must be
+    // a CONNACK. Only the AUTH exchange and an outright rejection may come
+    // first; anything else means the two ends disagree about the state of the
+    // connection, so deferring it would be papering over a protocol error.
+    throw MqttProtocolException(
+      'Broker sent ${packet.type.name.toUpperCase()} before CONNACK',
+    );
   }
 
   void _onTransportError(Object error, StackTrace stackTrace) {
@@ -803,13 +996,16 @@ final class ConnectionManager {
   }
 
   void _onPingTimeout() {
-    logger.log(MqttLogLevel.warning, 'Keep alive timeout');
+    final waited = _keepAlive.effectivePingResponseTimeout;
+    final message =
+        'No PINGRESP within ${waited.inMilliseconds} ms; connection is dead';
+    logger.log(MqttLogLevel.warning, message);
     if (!_running) {
       return;
     }
     unawaited(
       _startConnectionLoss(
-        error: MqttConnectionException('Keep alive timeout'),
+        error: MqttConnectionException(message),
         stackTrace: StackTrace.current,
       ),
     );
@@ -818,7 +1014,24 @@ final class ConnectionManager {
   Future<void> _teardownTransport() async {
     _handshakeComplete = false;
     _deferredPackets.clear();
+    _deferredBytes = 0;
     _connectPacket = null;
+    // Maximum Packet Size is negotiated per network connection (section
+    // 3.1.2.11.4). Carrying it into the next attempt would police that
+    // attempt's CONNECT — written before any CONNACK of its own — against a
+    // limit the new server never set, and an oversized CONNECT is fatal.
+    maximumPacketSize = 268435455;
+    // A re-authentication only exists for the life of one network connection,
+    // so its caller has to be released rather than left waiting for an AUTH
+    // that can no longer arrive.
+    final reauthentication = _reauthentication;
+    _reauthentication = null;
+    if (reauthentication != null && !reauthentication.isCompleted) {
+      reauthentication.completeError(
+        MqttConnectionException('Connection lost during re-authentication'),
+        StackTrace.current,
+      );
+    }
     final incomingSub = _incomingSub;
     _incomingSub = null;
     final transport = _transport;

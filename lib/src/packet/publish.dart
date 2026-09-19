@@ -7,6 +7,7 @@ import '../exception/mqtt_exception.dart';
 import '../mqtt_qos.dart';
 import '../property/mqtt_property.dart';
 import '../property/property_codec.dart';
+import '../topic.dart';
 import 'mqtt_packet.dart';
 
 /// PUBLISH packet (specification section 3.3).
@@ -79,6 +80,15 @@ final class MqttPublishPacket extends MqttPacket
     }
 
     final topicName = MqttUtf8.decode(reader);
+    if (topicName.isNotEmpty) {
+      // MQTT-3.3.2-2: the Topic Name in a PUBLISH must not hold wildcards.
+      // An empty Topic Name is legal and means the topic comes from a Topic
+      // Alias, so only a non-empty one is a Topic Name to check here.
+      final problem = MqttTopic.checkName(topicName);
+      if (problem != null) {
+        throw MqttProtocolException('PUBLISH topic name $problem');
+      }
+    }
     int packetIdentifier = 0;
     if (qos != MqttQos.atMostOnce) {
       packetIdentifier = reader.readUint16();

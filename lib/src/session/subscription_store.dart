@@ -21,17 +21,6 @@ final class SubscriptionStore {
 
   int get count => _subscriptions.length;
 
-  bool contains(String topicFilter) => _subscriptions.containsKey(topicFilter);
-
-  StoredSubscription? operator [](String topicFilter) =>
-      _subscriptions[topicFilter];
-
-  List<StoredSubscription> get all => List.unmodifiable(_subscriptions.values);
-
-  /// The subscriptions themselves, without their identifiers.
-  List<MqttSubscription> get subscriptions =>
-      List.unmodifiable(_subscriptions.values.map((s) => s.subscription));
-
   void add(MqttSubscription subscription, {int? subscriptionIdentifier}) {
     _subscriptions[subscription.topicFilter] = StoredSubscription(
       subscription,

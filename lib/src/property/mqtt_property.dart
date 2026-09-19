@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../exception/mqtt_exception.dart';
+import '../topic.dart';
 
 /// The wire data type of a property value.
 enum MqttPropertyType {
@@ -431,6 +432,15 @@ void _requireMaximumQos(Object value) {
   }
 }
 
+/// MQTT-3.3.2-14: the Response Topic MUST NOT contain wildcard characters.
+/// It is a Topic Name, so the rest of section 4.7.3 applies as well.
+void _requireTopicName(Object value) {
+  final problem = MqttTopic.checkName(value as String);
+  if (problem != null) {
+    throw MqttProtocolException('Response Topic $problem');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Metadata registry
 // ---------------------------------------------------------------------------
@@ -479,6 +489,7 @@ Map<int, MqttPropertyMeta> _buildMeta() {
         MqttPropertyContext.publish,
         MqttPropertyContext.will,
       },
+      validator: _requireTopicName,
       create: (v) => ResponseTopic(v as String),
     ),
     MqttPropertyMeta(

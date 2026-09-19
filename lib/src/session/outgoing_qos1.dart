@@ -8,6 +8,7 @@ import '../property/mqtt_property.dart';
 final class OutgoingQos1Entry {
   OutgoingQos1Entry({
     required this.packetIdentifier,
+    required this.sequence,
     required this.topic,
     required this.payload,
     required this.retain,
@@ -15,13 +16,15 @@ final class OutgoingQos1Entry {
   });
 
   final int packetIdentifier;
+
+  /// Publish order within the session, used to re-send in the order the
+  /// original PUBLISH packets were sent (MQTT-4.6.0-1).
+  final int sequence;
+
   final String topic;
   final Uint8List payload;
   final bool retain;
   final List<MqttProperty> properties;
-
-  /// Set once the packet has been (re)transmitted with DUP=1.
-  bool duplicate = false;
 
   final Completer<MqttPublishResult> completer = Completer<MqttPublishResult>();
 }
@@ -33,8 +36,6 @@ final class OutgoingQos1Store {
   int get count => _entries.length;
 
   Iterable<OutgoingQos1Entry> get entries => _entries.values;
-
-  bool contains(int packetIdentifier) => _entries.containsKey(packetIdentifier);
 
   OutgoingQos1Entry? operator [](int packetIdentifier) =>
       _entries[packetIdentifier];
