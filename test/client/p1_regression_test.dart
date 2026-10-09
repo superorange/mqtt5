@@ -280,10 +280,14 @@ void main() {
     );
     await connecting;
 
-    await expectLater(
-      client.publish('t', Uint8List(1), qos: MqttQos.atLeastOnce),
-      throwsA(isA<MqttTimeoutException>()),
-    );
+    Object? publishError;
+    final published =
+        client.publish('t', Uint8List(1), qos: MqttQos.atLeastOnce);
+    published.then((_) {}, onError: (Object error) {
+      publishError = error;
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+    expect(publishError, isNull);
     expect(client.inflightCount, 1);
     transports.last.takeOutgoing();
 

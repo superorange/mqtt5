@@ -42,8 +42,16 @@ abstract class MqttSocketTransport implements MqttTransport {
     try {
       socket.setOption(SocketOption.tcpNoDelay, true);
     } on SocketException {
-      // tcpNoDelay is best-effort.
+      // Best effort: thrown for a socket that is already closing.
+    } on OSError {
+      // Best effort: the native call fails this way, for example with EINVAL
+      // on macOS when the peer has already reset the connection. The option
+      // only lowers latency; that loss is reported through the stream.
     }
+    // Write failures (EPIPE, ECONNRESET) are reported on `done`, not by add().
+    // Unobserved they would surface as uncaught errors; the read side reports
+    // the same loss through [incoming].
+    socket.done.then<void>((_) {}, onError: (Object _) {});
     _socket = socket;
     _connected = true;
     _closed = false;

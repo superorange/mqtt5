@@ -75,11 +75,6 @@ void main() {
           () => r.readBytes(2), throwsA(isA<MqttIncompletePacketException>()));
     });
 
-    test('throws malformed on negative length', () {
-      final r = MqttReader(Uint8List.fromList([0x01]));
-      expect(
-          () => r.readBytes(-1), throwsA(isA<MqttMalformedPacketException>()));
-    });
   });
 
   test('MqttException includes its subtype and cause in diagnostics', () {

@@ -13,8 +13,6 @@ final class PacketIdentifierPool {
   int _next = 1;
   Completer<void>? _releaseSignal;
 
-  int get inUseCount => _inUse.length;
-
   /// Attempts to allocate an identifier, or returns null if exhausted.
   int? tryAllocate() {
     for (var i = 0; i < maxIdentifier; i++) {
@@ -51,21 +49,6 @@ final class PacketIdentifierPool {
         final signal = _releaseSignal ??= Completer<void>();
         await signal.future;
       }
-    }
-  }
-
-  /// Reserves [identifier] explicitly, rejecting identifiers already in use
-  /// or out of range.
-  void reserve(int identifier) {
-    if (identifier < 1 || identifier > maxIdentifier) {
-      throw MqttFlowControlException(
-        'Packet identifier out of range: $identifier',
-      );
-    }
-    if (!_inUse.add(identifier)) {
-      throw MqttFlowControlException(
-        'Packet identifier already in use: $identifier',
-      );
     }
   }
 

@@ -10,14 +10,16 @@ import 'package:mqtt5/src/packet/mqtt_packet_codec.dart';
 import 'package:mqtt5/src/subscription.dart';
 import 'package:test/test.dart';
 
-const String _mosquitto = '/opt/homebrew/sbin/mosquitto';
+import '../support/mosquitto_tools.dart';
 
 void main() {
-  if (!File(_mosquitto).existsSync()) {
+  final mosquitto = mosquittoProgram('mosquitto', directory: 'sbin');
+  if (mosquitto == null) {
     // Still declare the group so test output reflects the skip.
     group('mosquitto integration', () {
       test('skipped: mosquitto not installed', () {
-        markTestSkipped('mosquitto binary not found at $_mosquitto');
+        markTestSkipped('mosquitto binary not found; install mosquitto or set '
+            'MQTT5_MOSQUITTO_PREFIX');
       });
     });
     return;
@@ -258,7 +260,7 @@ allow_anonymous true
 ''');
 
   final process = await Process.start(
-    _mosquitto,
+    requireMosquittoProgram('mosquitto', directory: 'sbin'),
     ['-c', config.path],
     mode: ProcessStartMode.normal,
   );

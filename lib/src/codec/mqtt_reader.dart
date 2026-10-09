@@ -42,10 +42,9 @@ final class MqttReader {
     return value;
   }
 
+  /// Reads [length] bytes; [length] is never negative (it comes from a
+  /// Two Byte Integer or from [remainingLength]).
   Uint8List readBytes(int length) {
-    if (length < 0) {
-      throw MqttMalformedPacketException('Negative byte length: $length');
-    }
     _ensureAvailable(length);
     final result = Uint8List.sublistView(_data, _offset, _offset + length);
     _offset += length;
@@ -53,15 +52,6 @@ final class MqttReader {
   }
 
   Uint8List readRemaining() => readBytes(remainingLength);
-
-  /// Skips [length] bytes without copying them.
-  void skip(int length) {
-    if (length < 0) {
-      throw MqttMalformedPacketException('Negative skip length: $length');
-    }
-    _ensureAvailable(length);
-    _offset += length;
-  }
 
   void _ensureAvailable(int count) {
     if (remainingLength < count) {

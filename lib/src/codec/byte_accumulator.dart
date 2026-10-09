@@ -11,8 +11,6 @@ final class ByteAccumulator {
 
   int get available => _end - _start;
 
-  bool get isEmpty => available == 0;
-
   void append(Uint8List chunk) {
     if (chunk.isEmpty) {
       return;

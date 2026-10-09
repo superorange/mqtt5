@@ -61,6 +61,16 @@ class MqttMalformedPacketException extends MqttProtocolException {
   MqttMalformedPacketException(super.message, [super.cause]);
 }
 
+/// A Topic Alias that is 0 or above the negotiated maximum
+/// (section 3.3.2.3.4). Answered with DISCONNECT 0x94.
+///
+/// An alias inside that range with an empty topic name, which this client
+/// has not been told a mapping for, is a plain [MqttProtocolException]
+/// (DISCONNECT 0x82). It is not this type.
+class MqttTopicAliasInvalidException extends MqttProtocolException {
+  MqttTopicAliasInvalidException(super.message, [super.cause]);
+}
+
 /// The peer sent more unacknowledged QoS 1/2 publications than the Receive
 /// Maximum this client declared in its CONNECT packet.
 class MqttReceiveMaximumExceededException extends MqttProtocolException {
@@ -70,6 +80,19 @@ class MqttReceiveMaximumExceededException extends MqttProtocolException {
 /// A packet larger than the negotiated/configured maximum packet size.
 class MqttPacketTooLargeException extends MqttProtocolException {
   MqttPacketTooLargeException(super.message, [super.cause]);
+}
+
+/// The broker resumed a session (Session Present 1) that this client instance
+/// holds no state for (MQTT-3.2.2-4).
+///
+/// Session state lives in memory and belongs to one `MqttClient` instance. A
+/// new instance — in a new process or the same one — that connects with
+/// `cleanStart: false` while the broker still keeps the session gets this
+/// error, and the connection is closed with DISCONNECT 0x82. Connect with
+/// `cleanStart: true`, or pass `adoptBrokerSession: true` to `connect` to
+/// take the broker's session over knowingly.
+class MqttSessionNotOwnedException extends MqttProtocolException {
+  MqttSessionNotOwnedException(super.message, [super.cause]);
 }
 
 /// An exception thrown by transport level failures.
@@ -120,8 +143,11 @@ class MqttFlowControlException extends MqttException {
   MqttFlowControlException(super.message, [super.cause]);
 }
 
-/// Internal marker used by the incremental decoder: there is not yet enough
-/// buffered data to decode a complete packet. This is never surfaced to users.
-class MqttIncompletePacketException extends MqttException {
+/// A packet whose fields run past the end of its declared Remaining Length.
+///
+/// The incremental decoder only ever hands complete packets to the parsers,
+/// so running out of bytes inside one means the packet itself is malformed
+/// (section 4.13), not that more data is on its way.
+class MqttIncompletePacketException extends MqttMalformedPacketException {
   MqttIncompletePacketException(super.message);
 }

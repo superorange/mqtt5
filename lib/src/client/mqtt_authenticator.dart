@@ -22,3 +22,15 @@ final class MqttAuthResponse {
 abstract interface class MqttAuthenticator {
   Future<MqttAuthResponse?> authenticate(MqttAuthChallenge challenge);
 }
+
+/// Optionally implemented by an [MqttAuthenticator] whose mechanism ends with
+/// data the client must check, such as the server signature of SCRAM.
+///
+/// The connection is reported as connected (or a re-authentication as
+/// complete) only after [verifyServer] returns; throwing rejects the server
+/// and closes the connection.
+abstract interface class MqttAuthenticationVerifier {
+  /// Called with the Authentication Data carried by the successful CONNACK,
+  /// or by the AUTH 0x00 that ends a re-authentication.
+  Future<void> verifyServer(MqttAuthChallenge outcome);
+}

@@ -8,104 +8,111 @@ import '../exception/mqtt_exception.dart';
 /// A slot is taken before a QoS 1/2 PUBLISH is sent and given back when its
 /// acknowledgement completes (PUBACK/PUBCOMP, or a PUBREC error). The quota
 /// restricts PUBLISH packets only: MQTT-3.3.4-8 forbids delaying any other
-/// packet because the quota is exhausted, so PUBREL is sent without consulting
-/// it.
+/// packet because the quota is exhausted, so PUBREL never consults it.
 ///
-/// The quota is per network connection, not per session (section 4.9), which
-/// is why [reset] runs on every connection loss and every resumed session.
+/// Slots are handed out strictly first come, first served. A caller that
+/// finds a free slot while others are queued still queues behind them, and a
+/// released slot is not given to a waiter directly: the owner first lets a
+/// resumed session's backlog (older publications) use it, then calls
+/// [dispatch]. Both rules keep publications on the wire in the order the
+/// application made them.
+///
+/// The quota is per network connection (section 4.9). While there is no
+/// connection the controller is [suspend]ed: waiters keep their place instead
+/// of failing, and are served when the next connection [resume]s.
 final class FlowController {
-  int receiveMaximum;
-
   FlowController({this.receiveMaximum = 65535});
 
+  int receiveMaximum;
   int _outstanding = 0;
+  bool _open = false;
+  final ListQueue<_Waiter> _waiters = ListQueue<_Waiter>();
 
-  /// Waiters in arrival order.
-  ///
-  /// One completer per waiter rather than one shared completer for all of
-  /// them: releasing a single slot should wake the one caller that can use it,
-  /// not every caller so that all but one immediately go back to waiting. With
-  /// a shared completer, N blocked publishes cost O(N) wakeups per release and
-  /// O(N^2) over the queue.
-  final ListQueue<Completer<void>> _waiters = ListQueue<Completer<void>>();
-
-  int get outstanding => _outstanding;
-
-  /// The number of callers currently blocked in [acquire].
-  int get waiting => _waiters.length;
-
-  /// Acquires a send slot, waiting until one is available.
+  /// Takes a slot, waiting behind earlier callers while the quota is used up
+  /// or there is no connection.
   ///
   /// When [deadline] passes first, [MqttTimeoutException] is thrown and no
-  /// slot is taken, so a caller that gives up cannot leak quota.
-  Future<void> acquire({DateTime? deadline}) async {
-    while (_outstanding >= receiveMaximum) {
-      final waiter = Completer<void>();
-      _waiters.addLast(waiter);
-      if (deadline != null) {
-        final remaining = deadline.difference(DateTime.now());
-        if (remaining <= Duration.zero) {
-          _waiters.remove(waiter);
-          throw MqttTimeoutException(
-            'Timed out waiting for a Receive Maximum slot',
-          );
-        }
-        await waiter.future.timeout(remaining, onTimeout: () {});
-        // Whether it was woken or timed out, this waiter is done with the
-        // queue. Dropping it here keeps [release] from handing a slot to a
-        // caller that has already given up, which would strand that slot.
-        _waiters.remove(waiter);
-      } else {
-        await waiter.future;
-      }
+  /// slot is taken.
+  Future<void> acquire({DateTime? deadline}) {
+    if (_open && _waiters.isEmpty && _outstanding < receiveMaximum) {
+      _outstanding++;
+      return Future<void>.value();
     }
-    _outstanding++;
+    final waiter = _Waiter();
+    _waiters.addLast(waiter);
+    if (deadline != null) {
+      final remaining = deadline.difference(DateTime.now());
+      waiter.timer = Timer(
+        remaining.isNegative ? Duration.zero : remaining,
+        () {
+          if (_waiters.remove(waiter)) {
+            waiter.completer.completeError(
+              MqttTimeoutException(
+                  'Timed out waiting for a Receive Maximum slot'),
+            );
+          }
+        },
+      );
+    }
+    return waiter.completer.future;
   }
 
-  /// Takes a slot if one is free, without waiting. Returns false when the
-  /// quota is exhausted.
+  /// Takes a slot if one is free, ignoring queued callers. Reserved for
+  /// retransmissions, which are older than anything waiting.
   bool tryAcquire() {
-    if (_outstanding >= receiveMaximum) {
+    if (!_open || _outstanding >= receiveMaximum) {
       return false;
     }
     _outstanding++;
     return true;
   }
 
-  /// Releases a slot, waking one waiter if any.
+  /// Gives a slot back. Call [dispatch] afterwards to serve waiters.
   ///
-  /// The quota is never incremented above its initial value, matching the
-  /// clamp the specification describes in section 4.9 for the PUBCOMP that
-  /// answers a PUBREL retransmitted on a new network connection.
+  /// Never goes below zero: the PUBCOMP answering a PUBREL re-sent on a new
+  /// connection releases a slot that connection never took (section 4.9).
   void release() {
     if (_outstanding > 0) {
       _outstanding--;
     }
-    _wakeOne();
   }
 
-  /// Resets the outstanding count (called when a connection is lost) and
-  /// wakes any blocked acquirers.
-  void reset() {
+  /// Hands free slots to waiters in arrival order.
+  void dispatch() {
+    while (_open && _waiters.isNotEmpty && _outstanding < receiveMaximum) {
+      final waiter = _waiters.removeFirst();
+      waiter.timer?.cancel();
+      _outstanding++;
+      waiter.completer.complete();
+    }
+  }
+
+  /// The connection is gone: no slot is outstanding any more, and waiters
+  /// hold their place until [resume].
+  void suspend() {
+    _open = false;
     _outstanding = 0;
-    // Every waiter can make progress now, so wake all of them rather than
-    // handing the whole freed quota to the first in line.
-    while (_waiters.isNotEmpty) {
-      final waiter = _waiters.removeFirst();
-      if (!waiter.isCompleted) {
-        waiter.complete();
-      }
-    }
   }
 
-  /// Wakes the longest-waiting caller that is still waiting.
-  void _wakeOne() {
+  /// A new connection with the server's [receiveMaximum] for it. Waiters are
+  /// not served until [dispatch], so a resumed backlog can go first.
+  void resume(int receiveMaximum) {
+    this.receiveMaximum = receiveMaximum;
+    _outstanding = 0;
+    _open = true;
+  }
+
+  /// Fails every waiter with [error] (explicit disconnect, close, fatal end).
+  void failWaiters(Object error) {
     while (_waiters.isNotEmpty) {
       final waiter = _waiters.removeFirst();
-      if (!waiter.isCompleted) {
-        waiter.complete();
-        return;
-      }
+      waiter.timer?.cancel();
+      waiter.completer.completeError(error);
     }
   }
+}
+
+final class _Waiter {
+  final Completer<void> completer = Completer<void>();
+  Timer? timer;
 }

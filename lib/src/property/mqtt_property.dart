@@ -432,6 +432,12 @@ void _requireMaximumQos(Object value) {
   }
 }
 
+void _requireTopicAlias(Object value) {
+  if (value as int == 0) {
+    throw MqttTopicAliasInvalidException('Topic Alias must not be 0');
+  }
+}
+
 /// MQTT-3.3.2-14: the Response Topic MUST NOT contain wildcard characters.
 /// It is a Topic Name, so the rest of section 4.7.3 applies as well.
 void _requireTopicName(Object value) {
@@ -645,7 +651,7 @@ Map<int, MqttPropertyMeta> _buildMeta() {
       name: 'Topic Alias',
       type: MqttPropertyType.twoByteInteger,
       allowedPackets: {MqttPropertyContext.publish},
-      validator: _requireNonZero,
+      validator: _requireTopicAlias,
       create: (v) => TopicAlias(v as int),
     ),
     MqttPropertyMeta(
@@ -730,4 +736,5 @@ Map<int, MqttPropertyMeta> _buildMeta() {
 }
 
 /// Looks up the metadata for [identifier], or null if unknown.
-MqttPropertyMeta? propertyMetaFor(int identifier) => mqttPropertyMetaById[identifier];
+MqttPropertyMeta? propertyMetaFor(int identifier) =>
+    mqttPropertyMetaById[identifier];

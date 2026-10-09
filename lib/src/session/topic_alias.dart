@@ -21,8 +21,6 @@ final class TopicAliasMap {
   final List<int> _lruOrder = <int>[];
   int _next = 1;
 
-  int get count => _byAlias.length;
-
   /// Resolves an alias to its topic, or null if unknown.
   String? resolve(int alias) => _byAlias[alias];
 
@@ -41,7 +39,7 @@ final class TopicAliasMap {
   /// the full topic name alongside it (specification section 3.3.2.3.4).
   void register(int alias, String topic) {
     if (alias < 1 || alias > maximum) {
-      throw MqttProtocolException(
+      throw MqttTopicAliasInvalidException(
         'Topic alias $alias exceeds the negotiated maximum $maximum',
       );
     }

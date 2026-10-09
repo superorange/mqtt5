@@ -219,7 +219,7 @@ void main() {
   });
 
   group('operation timeout', () {
-    test('publish fails when the broker never acknowledges', () async {
+    test('an in-session publish waits past operationTimeout', () async {
       final transport = MemoryTransport();
       final client = MqttClient(
         host: 'x',
@@ -228,13 +228,20 @@ void main() {
       );
       await handshake(client, () => transport);
 
-      await expectLater(
-        client.publish('a/b', Uint8List(0), qos: MqttQos.atLeastOnce),
-        throwsA(isA<MqttTimeoutException>()),
-      );
+      var completed = false;
+      final publish =
+          client.publish('a/b', Uint8List(0), qos: MqttQos.atLeastOnce);
+      // whenComplete forwards the eventual connection error. ignore() keeps
+      // that extra future from becoming an uncaught error; [publish] is
+      // still asserted below.
+      publish.whenComplete(() => completed = true).ignore();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(completed, isFalse);
       // The PUBLISH is already on the wire, so session state stays until
       // PUBACK, session discard, or disconnect.
       expect(client.inflightCount, 1);
+      await client.close();
+      await expectLater(publish, throwsA(isA<MqttConnectionException>()));
     });
 
     test('subscribe fails when the broker never acknowledges', () async {

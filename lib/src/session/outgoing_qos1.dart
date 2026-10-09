@@ -3,9 +3,10 @@ import 'dart:typed_data';
 
 import '../client/mqtt_publish_result.dart';
 import '../property/mqtt_property.dart';
+import 'awaiting_ack.dart';
 
 /// A QoS 1 PUBLISH awaiting PUBACK.
-final class OutgoingQos1Entry {
+final class OutgoingQos1Entry with AwaitingAck {
   OutgoingQos1Entry({
     required this.packetIdentifier,
     required this.sequence,
@@ -13,7 +14,8 @@ final class OutgoingQos1Entry {
     required this.payload,
     required this.retain,
     required this.properties,
-  });
+    Completer<MqttPublishResult>? completer,
+  }) : completer = completer ?? Completer<MqttPublishResult>();
 
   final int packetIdentifier;
 
@@ -26,7 +28,23 @@ final class OutgoingQos1Entry {
   final bool retain;
   final List<MqttProperty> properties;
 
-  final Completer<MqttPublishResult> completer = Completer<MqttPublishResult>();
+  final Completer<MqttPublishResult> completer;
+
+  /// Whether this publication has been put on the wire with DUP set, i.e.
+  /// the server may already hold it.
+  bool retransmitted = false;
+
+  /// The same publication under a new packet identifier, for a server that
+  /// refused the original one as still in use (reason code 0x91).
+  OutgoingQos1Entry withIdentifier(int packetIdentifier) => OutgoingQos1Entry(
+        packetIdentifier: packetIdentifier,
+        sequence: sequence,
+        topic: topic,
+        payload: payload,
+        retain: retain,
+        properties: properties,
+        completer: completer,
+      );
 }
 
 /// Tracks outgoing QoS 1 messages awaiting PUBACK.

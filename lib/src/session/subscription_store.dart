@@ -9,8 +9,6 @@ final class StoredSubscription {
 
   /// The Subscription Identifier sent with the original SUBSCRIBE, if any.
   final int? subscriptionIdentifier;
-
-  String get topicFilter => subscription.topicFilter;
 }
 
 /// Tracks the client's active subscriptions so they can be re-established
@@ -18,8 +16,6 @@ final class StoredSubscription {
 final class SubscriptionStore {
   final Map<String, StoredSubscription> _subscriptions =
       <String, StoredSubscription>{};
-
-  int get count => _subscriptions.length;
 
   void add(MqttSubscription subscription, {int? subscriptionIdentifier}) {
     _subscriptions[subscription.topicFilter] = StoredSubscription(
@@ -43,7 +39,8 @@ final class SubscriptionStore {
     final groups = <int?, List<MqttSubscription>>{};
     for (final stored in _subscriptions.values) {
       groups
-          .putIfAbsent(stored.subscriptionIdentifier, () => <MqttSubscription>[])
+          .putIfAbsent(
+              stored.subscriptionIdentifier, () => <MqttSubscription>[])
           .add(stored.subscription);
     }
     return groups;

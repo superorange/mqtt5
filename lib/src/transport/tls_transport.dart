@@ -38,15 +38,10 @@ final class TlsTransport extends MqttSocketTransport {
       sourceAddress: source != null ? InternetAddress(source) : null,
     );
 
-    final remaining = deadline.difference(DateTime.now());
-    if (remaining <= Duration.zero) {
-      socket.destroy();
-      throw SocketException(
-        'TLS handshake timed out after ${timeout.inMilliseconds} ms',
-        address: socket.remoteAddress,
-        port: port,
-      );
-    }
+    // If the TCP connect used up the whole budget, the zero timeout below
+    // fails the handshake straight away through the same path.
+    final left = deadline.difference(DateTime.now());
+    final remaining = left.isNegative ? Duration.zero : left;
 
     try {
       return await SecureSocket.secure(

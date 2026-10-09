@@ -126,14 +126,17 @@ void main() {
     expect(transports, hasLength(2), reason: 'should have reconnected');
   });
 
-  test('an exception thrown by a message listener does not kill the '
+  test(
+      'an exception thrown by a message listener does not kill the '
       'connection', () async {
     final transport = MemoryTransport();
     final uncaught = <Object>[];
+    final reported = <Object>[];
     late MqttClient client;
 
     await runZonedGuarded(() async {
       client = MqttClient(host: 'x', transportFactory: () => transport);
+      client.errors.listen(reported.add);
       final connecting = client.connect();
       await Future<void>.delayed(Duration.zero);
       transport.inject(
@@ -150,7 +153,8 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     }, (error, stack) => uncaught.add(error));
 
-    expect(uncaught, [isA<StateError>()]);
+    expect(uncaught, isEmpty);
+    expect(reported, [isA<StateError>()]);
     expect(client.metrics.protocolErrorCount, 0);
     expect(client.state, MqttConnectionState.connected);
   });

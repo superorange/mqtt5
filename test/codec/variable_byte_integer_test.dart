@@ -30,15 +30,15 @@ void main() {
       );
     });
 
-    test('reports encoded length', () {
-      expect(VariableByteInteger.encodedLength(0), 1);
-      expect(VariableByteInteger.encodedLength(127), 1);
-      expect(VariableByteInteger.encodedLength(128), 2);
-      expect(VariableByteInteger.encodedLength(16383), 2);
-      expect(VariableByteInteger.encodedLength(16384), 3);
-      expect(VariableByteInteger.encodedLength(2097151), 3);
-      expect(VariableByteInteger.encodedLength(2097152), 4);
-      expect(VariableByteInteger.encodedLength(268435455), 4);
+    test('encodes the boundary values in 1-4 bytes', () {
+      expect(VariableByteInteger.encode(0).length, 1);
+      expect(VariableByteInteger.encode(127).length, 1);
+      expect(VariableByteInteger.encode(128).length, 2);
+      expect(VariableByteInteger.encode(16383).length, 2);
+      expect(VariableByteInteger.encode(16384).length, 3);
+      expect(VariableByteInteger.encode(2097151).length, 3);
+      expect(VariableByteInteger.encode(2097152).length, 4);
+      expect(VariableByteInteger.encode(268435455).length, 4);
     });
   });
 

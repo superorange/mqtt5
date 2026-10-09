@@ -20,3 +20,4 @@ mqtt5_docs/
 # FVM Version Cache
 .fvm/
 /coverage/
+/report/

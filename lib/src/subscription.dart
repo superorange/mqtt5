@@ -71,14 +71,14 @@ final class MqttSubscriptionOptions {
       Object.hash(qos, noLocal, retainAsPublished, retainHandling);
 
   @override
-  String toString() =>
-      'MqttSubscriptionOptions(qos: $qos, noLocal: $noLocal, '
+  String toString() => 'MqttSubscriptionOptions(qos: $qos, noLocal: $noLocal, '
       'retainAsPublished: $retainAsPublished, retainHandling: $retainHandling)';
 }
 
 /// A topic filter and its options, as sent in a SUBSCRIBE packet.
 final class MqttSubscription {
-  const MqttSubscription(this.topicFilter, {this.options = const MqttSubscriptionOptions()});
+  const MqttSubscription(this.topicFilter,
+      {this.options = const MqttSubscriptionOptions()});
 
   final String topicFilter;
   final MqttSubscriptionOptions options;

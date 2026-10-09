@@ -1,8 +1,15 @@
 import 'dart:async';
 
-import 'package:mqtt5/src/exception/mqtt_exception.dart';
 import 'package:mqtt5/src/session/packet_identifier_pool.dart';
 import 'package:test/test.dart';
+
+/// Takes every identifier except [except].
+void _fill(PacketIdentifierPool pool, {Set<int> except = const {}}) {
+  for (var id = pool.tryAllocate(); id != null; id = pool.tryAllocate()) {}
+  for (final id in except) {
+    pool.release(id);
+  }
+}
 
 void main() {
   group('PacketIdentifierPool', () {
@@ -15,7 +22,7 @@ void main() {
 
     test('does not reuse in-flight identifiers', () {
       final pool = PacketIdentifierPool();
-      pool.reserve(1);
+      expect(pool.tryAllocate(), 1);
       expect(pool.tryAllocate(), 2);
       expect(pool.tryAllocate(), 3);
     });
@@ -24,42 +31,26 @@ void main() {
       final pool = PacketIdentifierPool();
       final id = await pool.allocate();
       pool.release(id);
-      // Reserve every other identifier so the released one is the only
+      // Take every other identifier so the released one is the only
       // remaining choice.
-      for (var i = 1; i <= 65535; i++) {
-        if (i != id) {
-          pool.reserve(i);
-        }
-      }
+      _fill(pool, except: {id});
       final again = await pool.allocate();
       expect(again, id);
     });
 
-    test('reserve rejects duplicates and out of range', () {
-      final pool = PacketIdentifierPool();
-      pool.reserve(10);
-      expect(() => pool.reserve(10), throwsA(isA<MqttFlowControlException>()));
-      expect(() => pool.reserve(0), throwsA(isA<MqttFlowControlException>()));
-      expect(
-          () => pool.reserve(65536), throwsA(isA<MqttFlowControlException>()));
-    });
-
     test('wraps around at 65535', () {
       final pool = PacketIdentifierPool();
-      pool.reserve(65535);
-      for (var i = 0; i < 65534; i++) {
-        expect(pool.tryAllocate(), isNotNull);
+      for (var i = 1; i <= 65535; i++) {
+        expect(pool.tryAllocate(), i);
       }
       expect(pool.tryAllocate(), isNull);
-      expect(pool.inUseCount, 65535);
+      pool.release(7);
+      expect(pool.tryAllocate(), 7);
     });
 
     test('allocate waits for a release when exhausted', () async {
       final pool = PacketIdentifierPool();
-      // Reserve everything except 1..2 are already allocated below.
-      for (var i = 1; i <= 65535; i++) {
-        pool.reserve(i);
-      }
+      _fill(pool);
       final future = pool.allocate();
       var completed = false;
       unawaited(future.then((_) => completed = true));
@@ -71,16 +62,15 @@ void main() {
 
     test('reset clears all identifiers', () {
       final pool = PacketIdentifierPool();
-      pool.reserve(3);
+      pool.tryAllocate();
+      pool.tryAllocate();
       pool.reset();
       expect(pool.tryAllocate(), 1);
     });
 
     test('reset wakes an allocator waiting on exhaustion', () async {
       final pool = PacketIdentifierPool();
-      for (var i = 1; i <= PacketIdentifierPool.maxIdentifier; i++) {
-        pool.reserve(i);
-      }
+      _fill(pool);
 
       final waiting = pool.allocate();
       await Future<void>.delayed(Duration.zero);

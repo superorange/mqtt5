@@ -1,3 +1,83 @@
+## 0.5.0
+
+Breaking changes:
+
+- A new `MqttClient` can no longer resume a session the broker still holds.
+  `connect(cleanStart: false)` on a fresh client throws
+  `MqttSessionNotOwnedException`. Use `cleanStart: true`, or
+  `adoptBrokerSession: true` if you want the messages queued while offline.
+- A QoS 1/2 `publish()` that has been sent no longer fails on
+  `operationTimeout`. Retrying it yourself is what caused duplicates. See
+  `ackTimeout` below.
+- `disconnect()` keeps unacknowledged QoS 1/2 messages when the session
+  outlives the connection. Their futures complete after the next
+  `connect(cleanStart: false)` resends them.
+- `connect()` throws `StateError` while `disconnect()` is running, or when
+  called with different settings while connecting or connected.
+- DISCONNECT `0x8E` (session taken over) stops the client.
+- Exceptions thrown by listeners of `messages`, `errors`, `errorEvents` and
+  `stateStream` go to `errors` instead of the zone.
+- `ArgumentError` for an empty client id with `cleanStart: false`, for
+  `TopicAlias(0)` in `publish`, and for server-only reason codes in
+  `disconnect()`/`close()`. `subscribeAll([])` and `unsubscribe([])` throw
+  when not connected.
+
+New:
+
+- `ackTimeout` (default 60s). If the broker keeps the connection open but
+  never acknowledges a QoS 1/2 message, the client reconnects so that a
+  persistent session resends it.
+- `connect(adoptBrokerSession: true)`.
+- `ReconnectManager.flapWindow` (default 2s).
+- `MqttPublishResult.isSuccess` / `isError`. `0x10` counts as success.
+- `MqttAuthenticationVerifier`, to check the server's final authentication
+  data before the connection is used.
+
+Fixes:
+
+- Messages that arrived before anyone listened to `messages` were acked and
+  then dropped, including the backlog of a resumed session. They are kept
+  until there is a listener (QoS 0 is capped at 1000), and QoS 1/2 is acked
+  after delivery.
+- Publications waiting for a Receive Maximum slot failed on a short
+  disconnect, and could go out in a different order than they were published.
+- Session recovery: `disconnect()` dropped in-flight QoS 1/2, EMQX `0x91`/`0x92`
+  replies were reported as failures, and a resent message too large for the
+  new server stalled the rest of the backlog.
+- A client that only publishes never noticed a dead link. Keep alive now also
+  watches incoming traffic, keeps sending PINGREQ while one is unanswered, and
+  times the first one from CONNECT.
+- Reconnect storms: there was no backoff after a server DISCONNECT or a
+  connection that dropped right away.
+- A protocol error in the same read as CONNACK left the client connected. It
+  now fails the first `connect()`. On automatic reconnects it is retried, as
+  is CONNACK `0x85`.
+- `connect()` called during an automatic reconnect could return before the
+  client was connected.
+- Subscriptions restored after a lost session were gone for good if the
+  connection dropped before the SUBACK.
+- A dropped connection during re-authentication stopped the client.
+- Calling `disconnect()` from a `stateStream` listener threw `Bad state`.
+- The keep-alive timer kept running during reconnect backoff. A socket reset
+  while setting `tcpNoDelay` failed the connection. A custom transport throwing
+  from `close()` broke teardown.
+- A leading BOM was stripped from received strings, and unpaired surrogates
+  were silently replaced.
+- An outgoing PUBLISH could carry a Subscription Identifier.
+- Wrong DISCONNECT reason codes: topic alias errors are `0x94` (`0x82` for an
+  unknown alias in range), malformed packets `0x81`, and a SUBACK/UNSUBACK with
+  the wrong number of reason codes now disconnects with `0x82`. A truncated
+  CONNACK is no longer retried.
+- A Reason String or User Property sent despite Request Problem Information 0
+  is a protocol error, and the Authentication Method in CONNACK must match
+  CONNECT.
+- A packet that failed to decode also discarded the valid packets before it
+  in the same read.
+- `MqttAuthPacket` with a non-success reason code and no properties left out
+  the property length.
+
+Tested against mosquitto 2.1.2 and EMQX 5.8.6, see `test/real_broker/`.
+
 ## 0.4.0
 
 A conformance pass against the OASIS MQTT 5.0 specification, then a second pass

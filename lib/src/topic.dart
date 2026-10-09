@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'codec/mqtt_utf8.dart';
+
 /// Topic Name and Topic Filter rules (specification section 4.7 and 4.8.2).
 ///
 /// The checks return a description of the first violation instead of throwing,
@@ -146,6 +148,11 @@ abstract final class MqttTopic {
     // space character is explicitly allowed (section 4.7.3).
     if (topic.codeUnits.contains(0)) {
       return 'must not contain the null character U+0000';
+    }
+    // MQTT-1.5.4-1: an unpaired surrogate has no UTF-8 encoding and would be
+    // replaced on the wire, sending the message to a different topic.
+    if (MqttUtf8.hasLoneSurrogate(topic)) {
+      return 'must not contain unpaired UTF-16 surrogates';
     }
     // MQTT-4.7.3-3. A UTF-16 code unit encodes to at most three UTF-8 bytes,
     // so a string shorter than a third of the limit cannot exceed it and does

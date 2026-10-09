@@ -14,17 +14,6 @@ abstract final class VariableByteInteger {
 
   static const int _maxBytes = 4;
 
-  /// Returns the number of bytes required to encode [value].
-  static int encodedLength(int value) {
-    _checkRange(value);
-    var length = 1;
-    while (value >= 128) {
-      value >>= 7;
-      length++;
-    }
-    return length;
-  }
-
   /// Encodes [value] into a standalone byte array.
   static Uint8List encode(int value) {
     _checkRange(value);

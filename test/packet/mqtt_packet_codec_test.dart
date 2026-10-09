@@ -154,11 +154,32 @@ void main() {
       expect(_encode(packet), [0xE0, 0x01, 0x00]);
     });
 
+    // Section 3.15.2.1: AUTH has no Remaining Length 1 form. A Reason Code
+    // other than Success always comes with a Property Length.
     test('AUTH continue authentication', () {
       const packet = MqttAuthPacket(
         reasonCode: MqttReasonCode.continueAuthentication,
       );
-      expect(_encode(packet), [0xF0, 0x01, 0x18]);
+      expect(_encode(packet), [0xF0, 0x02, 0x18, 0x00]);
+    });
+
+    test('AUTH success without properties omits both fields', () {
+      expect(_encode(const MqttAuthPacket()), [0xF0, 0x00]);
+      expect(
+        _encode(const MqttAuthPacket(reasonCode: MqttReasonCode.success)),
+        [0xF0, 0x00],
+      );
+    });
+
+    test('AUTH success with properties keeps the Reason Code', () {
+      const packet = MqttAuthPacket(
+        reasonCode: MqttReasonCode.success,
+        properties: [AuthenticationMethod('M')],
+      );
+      expect(
+        _encode(packet),
+        [0xF0, 0x06, 0x00, 0x04, 0x15, 0x00, 0x01, 0x4D],
+      );
     });
   });
 

@@ -13,8 +13,40 @@ import 'mqtt_writer.dart';
 abstract final class MqttUtf8 {
   static const int _maxLength = 0xFFFF;
 
+  /// Whether [value] holds a UTF-16 surrogate that is not part of a pair.
+  ///
+  /// Such a string has no UTF-8 encoding: `utf8.encode` would silently
+  /// substitute U+FFFD, changing (for example) the topic a message goes to.
+  /// MQTT-1.5.4-1 forbids encoding surrogates, so callers reject it instead.
+  static bool hasLoneSurrogate(String value) {
+    for (var i = 0; i < value.length; i++) {
+      final unit = value.codeUnitAt(i);
+      if (unit >= 0xD800 && unit <= 0xDBFF) {
+        if (i + 1 < value.length) {
+          final next = value.codeUnitAt(i + 1);
+          if (next >= 0xDC00 && next <= 0xDFFF) {
+            i++;
+            continue;
+          }
+        }
+        return true;
+      }
+      if (unit >= 0xDC00 && unit <= 0xDFFF) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /// Writes [value] as an MQTT UTF-8 string into [writer].
   static void encodeTo(MqttWriter writer, String value) {
+    if (hasLoneSurrogate(value)) {
+      throw ArgumentError.value(
+        value,
+        'value',
+        'MQTT UTF-8 string MUST NOT contain unpaired surrogates',
+      );
+    }
     final bytes = utf8.encode(value);
     if (bytes.length > _maxLength) {
       throw ArgumentError.value(
@@ -48,6 +80,14 @@ abstract final class MqttUtf8 {
       value = utf8.decode(bytes, allowMalformed: false);
     } on FormatException catch (e) {
       throw MqttMalformedPacketException('Malformed UTF-8 string', e);
+    }
+    // MQTT-1.5.4-3: 0xEF 0xBB 0xBF is U+FEFF and must not be stripped, but
+    // dart:convert drops a leading byte order mark. Put it back.
+    if (bytes.length >= 3 &&
+        bytes[0] == 0xEF &&
+        bytes[1] == 0xBB &&
+        bytes[2] == 0xBF) {
+      value = '\uFEFF$value';
     }
     if (value.contains('\u0000')) {
       throw MqttMalformedPacketException(

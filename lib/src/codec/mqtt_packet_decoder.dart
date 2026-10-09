@@ -29,19 +29,29 @@ final class MqttPacketDecoder {
   ///
   /// Throws [MqttMalformedPacketException] or [MqttProtocolException] for
   /// malformed input and [MqttPacketTooLargeException] when a declared
-  /// Remaining Length exceeds [maximumPacketSize].
+  /// Remaining Length exceeds [maximumPacketSize]. Packets decoded before the
+  /// faulty one are lost with the exception; use [add] and [nextPacket] to
+  /// act on each packet before the next is decoded.
   List<MqttPacket> feed(Uint8List chunk) {
-    _accumulator.append(chunk);
+    add(chunk);
     final packets = <MqttPacket>[];
-    while (true) {
-      final length = _peekPacketLength();
-      if (length == null) {
-        break;
-      }
-      final bytes = _accumulator.take(length);
-      packets.add(MqttPacketCodec.decode(bytes));
+    for (var p = nextPacket(); p != null; p = nextPacket()) {
+      packets.add(p);
     }
     return packets;
+  }
+
+  /// Buffers [chunk] without decoding anything.
+  void add(Uint8List chunk) => _accumulator.append(chunk);
+
+  /// Decodes and removes the next complete packet, or returns null when more
+  /// bytes are needed. Throws as [feed] does.
+  MqttPacket? nextPacket() {
+    final length = _peekPacketLength();
+    if (length == null) {
+      return null;
+    }
+    return MqttPacketCodec.decode(_accumulator.take(length));
   }
 
   /// Returns the total length in bytes of the next complete packet, or null

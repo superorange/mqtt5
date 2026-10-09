@@ -3,16 +3,16 @@ import 'dart:typed_data';
 
 import '../client/mqtt_publish_result.dart';
 import '../property/mqtt_property.dart';
+import 'awaiting_ack.dart';
 
 /// The state of an outgoing QoS 2 exchange.
 enum OutgoingQos2State {
   publishSent,
-  pubRecReceived,
   pubRelSent,
 }
 
 /// A QoS 2 PUBLISH in progress.
-final class OutgoingQos2Entry {
+final class OutgoingQos2Entry with AwaitingAck {
   OutgoingQos2Entry({
     required this.packetIdentifier,
     required this.sequence,
@@ -20,7 +20,8 @@ final class OutgoingQos2Entry {
     required this.payload,
     required this.retain,
     required this.properties,
-  });
+    Completer<MqttPublishResult>? completer,
+  }) : completer = completer ?? Completer<MqttPublishResult>();
 
   final int packetIdentifier;
 
@@ -40,7 +41,26 @@ final class OutgoingQos2Entry {
   /// arrives, which is also when [state] leaves [OutgoingQos2State.publishSent].
   int pubrecSequence = 0;
 
-  final Completer<MqttPublishResult> completer = Completer<MqttPublishResult>();
+  /// Whether the PUBLISH has been put on the wire with DUP set.
+  bool retransmitted = false;
+
+  /// Whether the PUBREL has been re-sent on a later connection, so a PUBCOMP
+  /// 0x92 ("not found") only means the server already finished the exchange.
+  bool pubrelResent = false;
+
+  final Completer<MqttPublishResult> completer;
+
+  /// The same publication under a new packet identifier, for a server that
+  /// refused the original one as still in use (reason code 0x91).
+  OutgoingQos2Entry withIdentifier(int packetIdentifier) => OutgoingQos2Entry(
+        packetIdentifier: packetIdentifier,
+        sequence: sequence,
+        topic: topic,
+        payload: payload,
+        retain: retain,
+        properties: properties,
+        completer: completer,
+      );
 }
 
 /// Tracks outgoing QoS 2 messages through the PUBLISH/PUBREC/PUBREL/PUBCOMP

@@ -68,6 +68,86 @@ void main() {
         () => ReconnectManager(jitterFactor: 1.1),
         throwsArgumentError,
       );
+      expect(
+        () => ReconnectManager(flapWindow: const Duration(milliseconds: -1)),
+        throwsArgumentError,
+      );
+      expect(
+        () => ReconnectManager(stableAfter: const Duration(milliseconds: -1)),
+        throwsArgumentError,
+      );
+    });
+
+    test('paceFor classifies handshake, flaps and stable drops', () {
+      final manager = ReconnectManager(
+        flapWindow: const Duration(seconds: 2),
+        stableAfter: const Duration(seconds: 10),
+      );
+
+      expect(
+        manager.paceFor(
+          handshakeComplete: false,
+          serverInitiated: false,
+          lived: Duration.zero,
+        ),
+        ReconnectPace.escalate,
+      );
+      expect(manager.attempt, 0);
+
+      manager.nextDelay();
+      expect(
+        manager.paceFor(
+          handshakeComplete: true,
+          serverInitiated: false,
+          lived: const Duration(milliseconds: 500),
+        ),
+        ReconnectPace.escalate,
+      );
+      expect(manager.attempt, 1);
+
+      expect(
+        manager.paceFor(
+          handshakeComplete: true,
+          serverInitiated: false,
+          lived: const Duration(seconds: 3),
+        ),
+        ReconnectPace.once,
+      );
+      expect(manager.attempt, 0);
+
+      manager.nextDelay();
+      expect(
+        manager.paceFor(
+          handshakeComplete: true,
+          serverInitiated: false,
+          lived: const Duration(seconds: 10),
+        ),
+        ReconnectPace.immediate,
+      );
+      expect(manager.attempt, 0);
+
+      manager.nextDelay();
+      manager.nextDelay();
+      expect(
+        manager.paceFor(
+          handshakeComplete: true,
+          serverInitiated: true,
+          lived: const Duration(seconds: 10),
+        ),
+        ReconnectPace.escalate,
+      );
+      expect(manager.attempt, 0);
+
+      manager.nextDelay();
+      expect(
+        manager.paceFor(
+          handshakeComplete: true,
+          serverInitiated: true,
+          lived: const Duration(milliseconds: 100),
+        ),
+        ReconnectPace.escalate,
+      );
+      expect(manager.attempt, 1);
     });
   });
 }

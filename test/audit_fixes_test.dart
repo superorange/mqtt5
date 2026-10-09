@@ -58,9 +58,8 @@ void main() {
         clientId: 'c',
         will: MqttWill(topic: 'w', payload: Uint8List(0xFFFF)),
       );
-      final decoded =
-          MqttPacketCodec.decode(MqttPacketCodec.encode(packet))
-              as MqttConnectPacket;
+      final decoded = MqttPacketCodec.decode(MqttPacketCodec.encode(packet))
+          as MqttConnectPacket;
       expect(decoded.will!.payload, hasLength(0xFFFF));
     });
   });
@@ -233,7 +232,7 @@ void main() {
       );
     });
 
-    test('P2-05 operationTimeout bounds the whole publish, not just the ack',
+    test('P2-05 operationTimeout bounds waiters, not an in-session publish',
         () async {
       final transport = MemoryTransport();
       final client = MqttClient(
@@ -244,21 +243,23 @@ void main() {
       await _handshake(client, transport, brokerReceiveMaximum: 1);
 
       // One slot; the broker never acknowledges anything.
-      var settled = 0;
+      var timedOut = 0;
       for (var i = 0; i < 20; i++) {
         client.publish('t', Uint8List(1), qos: MqttQos.atLeastOnce).then(
-              (_) => settled++,
-              onError: (Object _) => settled++,
-            );
+          (_) {},
+          onError: (Object error) {
+            if (error is MqttTimeoutException) timedOut++;
+          },
+        );
       }
       await Future<void>.delayed(const Duration(seconds: 1));
-      expect(settled, 20,
-          reason: 'every publish must settle within operationTimeout, '
-              'including the ones queued on flow control');
+      expect(timedOut, 19,
+          reason: 'only the publishes that never took a slot time out');
+      expect(client.inflightCount, 1);
+      await client.close();
     });
 
-    test('R2 disconnect reclaims publications abandoned by a timeout',
-        () async {
+    test('R2 disconnect reclaims in-session publications', () async {
       final transport = MemoryTransport();
       final client = MqttClient(
         host: 'h',
@@ -267,19 +268,23 @@ void main() {
       );
       await _handshake(client, transport);
 
+      final pending = <Future<Object>>[];
       for (var i = 0; i < 5; i++) {
-        try {
-          await client.publish('t', Uint8List(1), qos: MqttQos.atLeastOnce);
-        } on MqttTimeoutException {
-          // expected
-        }
+        pending.add(
+          client
+              .publish('t', Uint8List(1), qos: MqttQos.atLeastOnce)
+              .then<Object>((result) => result,
+                  onError: (Object error) => error),
+        );
       }
-      // Kept while the session is live, so a resume can retransmit them.
+      await Future<void>.delayed(const Duration(milliseconds: 80));
       expect(client.inflightCount, 5);
 
       await client.disconnect();
       expect(client.inflightCount, 0,
           reason: 'an explicit teardown must release the session slots');
+      final results = await Future.wait(pending);
+      expect(results, everyElement(isA<MqttConnectionException>()));
     });
 
     test('connect() validates arguments even when already connected', () async {

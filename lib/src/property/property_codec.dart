@@ -32,8 +32,10 @@ abstract final class PropertyCodec {
           'Unknown property identifier: $identifier',
         );
       }
+      // Section 2.2.2.2: an identifier not valid for the packet type makes the
+      // packet malformed.
       if (!meta.allowedPackets.contains(context)) {
-        throw MqttProtocolException(
+        throw MqttMalformedPacketException(
           'Property ${meta.name} is not allowed in $context',
         );
       }
@@ -98,7 +100,8 @@ abstract final class PropertyCodec {
     }
   }
 
-  static void _writeValue(MqttWriter writer, Object value, MqttPropertyType type) {
+  static void _writeValue(
+      MqttWriter writer, Object value, MqttPropertyType type) {
     switch (type) {
       case MqttPropertyType.byte:
         writer.writeByte(value as int);

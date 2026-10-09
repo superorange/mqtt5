@@ -42,8 +42,7 @@ Future<void> _settle([int turns = 12]) async {
 }
 
 /// Decodes every packet in [bytes], which may hold more than one.
-List<MqttPacket> _decodeAll(Uint8List bytes) =>
-    MqttPacketDecoder().feed(bytes);
+List<MqttPacket> _decodeAll(Uint8List bytes) => MqttPacketDecoder().feed(bytes);
 
 /// Takes everything the client has written and returns the packets of type [T].
 List<T> _sent<T extends MqttPacket>(MemoryTransport transport) =>
@@ -80,30 +79,11 @@ void main() {
       await client.close();
     });
 
-    test('a flood large enough to threaten memory is still a protocol error',
-        () async {
-      final transport = MemoryTransport();
-      final client = MqttClient(
-        host: 'h',
-        transportFactory: () => transport,
-        autoReconnect: false,
-      );
-      final errors = <Object>[];
-      client.errors.listen(errors.add);
-
-      final connecting = client.connect();
-      await _settle(2);
-      final fat = 'x' * 60000;
-      transport.inject(_concat([
-        _connack(),
-        for (var i = 0; i < 160; i++) _publish('flood/$i', fat),
-      ]));
-      await connecting.then<void>((_) {}, onError: errors.add);
-      await _settle();
-
-      expect(errors.whereType<MqttProtocolException>(), isNotEmpty);
-      await client.close();
-    });
+    // The 8 MiB "pre-session flood" limit was removed: packets are only
+    // deferred until the end of the read that carried the CONNACK (the
+    // handshake completes in microtasks, before the next socket event), so
+    // the deferral is bounded by one socket read and the limit could only be
+    // reached by injecting 8 MiB in a single call to an in-memory transport.
   });
 
   group('Maximum Packet Size is per connection (section 3.1.2.11.4)', () {
@@ -140,6 +120,9 @@ void main() {
       expect(client.serverCapabilities.maximumPacketSize, connectLength - 1);
 
       transports[0].injectError(MqttTransportException('peer reset'));
+      // A connection that did not last ReconnectManager.stableAfter is
+      // re-established after a backoff delay (a real 1 ms timer here).
+      await Future<void>.delayed(const Duration(milliseconds: 50));
       await _settle(40);
 
       expect(transports, hasLength(greaterThan(1)));
@@ -211,9 +194,8 @@ void main() {
     });
 
     test('an ordinary topic name is unaffected', () {
-      final decoded =
-          MqttPacketCodec.decode(_publish('sensors/1/temp', 'x'))
-              as MqttPublishPacket;
+      final decoded = MqttPacketCodec.decode(_publish('sensors/1/temp', 'x'))
+          as MqttPublishPacket;
       expect(decoded.topicName, 'sensors/1/temp');
     });
   });
@@ -288,9 +270,8 @@ void main() {
         Uint8List.fromList([1]),
         properties: const [TopicAlias(7)],
       );
-      final first =
-          MqttPacketCodec.decode(transport.takeOutgoingBytes())
-              as MqttPublishPacket;
+      final first = MqttPacketCodec.decode(transport.takeOutgoingBytes())
+          as MqttPublishPacket;
       // Establishing the alias carries the full topic name alongside it.
       expect(first.topicName, topic);
       expect(
@@ -299,9 +280,8 @@ void main() {
       );
 
       await client.publish(topic, Uint8List.fromList([2]));
-      final second =
-          MqttPacketCodec.decode(transport.takeOutgoingBytes())
-              as MqttPublishPacket;
+      final second = MqttPacketCodec.decode(transport.takeOutgoingBytes())
+          as MqttPublishPacket;
       expect(
         second.topicName,
         isEmpty,
@@ -319,8 +299,8 @@ void main() {
 
   group('MqttTopic.matches (section 4.7)', () {
     test('single-level wildcard', () {
-      expect(MqttTopic.matches('sport/+/player1', 'sport/tennis/player1'),
-          isTrue);
+      expect(
+          MqttTopic.matches('sport/+/player1', 'sport/tennis/player1'), isTrue);
       expect(MqttTopic.matches('sport/+', 'sport/tennis'), isTrue);
       expect(MqttTopic.matches('sport/+', 'sport'), isFalse);
       expect(MqttTopic.matches('sport/+', 'sport/tennis/player1'), isFalse);
@@ -345,11 +325,12 @@ void main() {
     test('a leading wildcard does not match \$-prefixed topics (MQTT-4.7.2-1)',
         () {
       expect(MqttTopic.matches('#', r'$SYS/broker/uptime'), isFalse);
-      expect(MqttTopic.matches('+/broker/uptime', r'$SYS/broker/uptime'),
-          isFalse);
+      expect(
+          MqttTopic.matches('+/broker/uptime', r'$SYS/broker/uptime'), isFalse);
       // Naming the level literally still matches.
       expect(MqttTopic.matches(r'$SYS/#', r'$SYS/broker/uptime'), isTrue);
-      expect(MqttTopic.matches(r'$SYS/+/uptime', r'$SYS/broker/uptime'), isTrue);
+      expect(
+          MqttTopic.matches(r'$SYS/+/uptime', r'$SYS/broker/uptime'), isTrue);
     });
 
     test('a shared subscription matches on its filter part', () {
@@ -449,30 +430,27 @@ void main() {
       await connecting;
       transport.takeOutgoingBytes();
 
-      // Both will time out; attach the expectations before either can reject,
-      // so neither becomes an unhandled asynchronous error.
-      final first = expectLater(
-        client.publish('t/1', Uint8List.fromList([1]),
-            qos: MqttQos.atLeastOnce),
-        throwsA(isA<MqttTimeoutException>()),
-      );
+      // The publish that took the slot does not time out: it owns that slot
+      // until PUBACK. The one still waiting for a slot does.
+      final first = client.publish('t/1', Uint8List.fromList([1]),
+          qos: MqttQos.atLeastOnce);
       await _settle(2);
       final blocked = expectLater(
         client.publish('t/2', Uint8List.fromList([2]),
             qos: MqttQos.atLeastOnce),
         throwsA(isA<MqttTimeoutException>()),
       );
-      await Future.wait([first, blocked]);
+      await blocked;
+      expect(client.inflightCount, 1);
 
-      // The publish that timed out keeps its slot on purpose: it stays in the
-      // session store for retransmission. The waiter that gave up is the one
-      // that must be gone from the queue — otherwise the slot freed by the
-      // late PUBACK below would be handed to a caller nobody is awaiting, and
-      // the quota would be stranded for the life of the connection.
+      // The waiter that gave up must be gone from the queue — otherwise the
+      // slot freed by the late PUBACK below would be handed to a caller
+      // nobody is awaiting, and the quota would be stranded.
       final stillInflight = _sent<MqttPublishPacket>(transport).single;
       transport.inject(MqttPacketCodec.encode(
         MqttPubackPacket(packetIdentifier: stillInflight.packetIdentifier),
       ));
+      await first;
       await _settle(3);
 
       final recovered = client.publish('t/3', Uint8List.fromList([3]),
@@ -532,7 +510,7 @@ void main() {
       expect(client.state, MqttConnectionState.disconnected);
       expect(
         errors.whereType<MqttConnectionException>().map((e) => e.message),
-        contains(contains('PINGRESP')),
+        contains(contains('PINGREQ')),
       );
       await client.close();
     });
@@ -610,6 +588,7 @@ void main() {
       // Drop the link. The new connection reports Session Present 0, so the
       // client re-subscribes; never answer that SUBSCRIBE, so it times out.
       transports[0].injectError(MqttTransportException('peer reset'));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
       await _settle(30);
       expect(transports, hasLength(greaterThan(1)));
       transports[1].takeOutgoingBytes();
